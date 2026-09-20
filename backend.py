@@ -140,7 +140,7 @@ def health():
 
 
 @app.get("/seasons")
-def seasons(mode: str = "battlegroundsduo", region: str = "EU"):
+def seasons(mode: str = "battlegrounds", region: str = "US"):
     if mode not in {"battlegrounds", "battlegroundsduo"}:
         raise HTTPException(status_code=400, detail="Invalid game mode.")
     if region not in {"EU", "US", "AP"}:
@@ -158,8 +158,8 @@ def seasons(mode: str = "battlegroundsduo", region: str = "EU"):
 def search_players(
     request: Request,
     btags: str,
-    mode: str = "battlegroundsduo",
-    region: str = "EU",
+    mode: str = "battlegrounds",
+    region: str = "US",
     season: str = "current",
 ):
     if mode not in {"battlegrounds", "battlegroundsduo"}:

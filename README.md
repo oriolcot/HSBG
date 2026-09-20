@@ -1,15 +1,18 @@
 # BG Lobby Scanner
 
-A small, open-source lookup tool for public Hearthstone Battlegrounds leaderboard ratings. Paste a few BattleTags, choose Solo or Duos, a region, and a season to get a quick read on a lobby.
+A small, open-source lookup tool for public Hearthstone Battlegrounds **MMR and regional leaderboard rank**. Paste a few BattleTags, choose Solo or Duos, a region, and a season to get a quick read on a lobby.
+
+> MMR is the number. Leaderboard rank is the context: a player at #100 Europe and one at #500 Americas tell very different stories.
 
 **Live site:** [mmrbg.duckdns.org](https://mmrbg.duckdns.org)
 
 ## What it does
 
 - Looks up up to 20 BattleTags at once.
+- Shows both a player's MMR and their position on the selected regional leaderboard.
 - Supports Battlegrounds Solo and Battlegrounds Duos.
 - Supports Europe, Americas, and Asia-Pacific.
-- Lets players check the current or an earlier leaderboard season.
+- Lets players check the current or an earlier leaderboard season, so ratings are read in the right context.
 - Uses Blizzard's public leaderboard endpoint; it does not request a Battle.net login or store player data.
 
 ## Project layout
