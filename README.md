@@ -1,36 +1,55 @@
-# BG Lobby Scanner
+# HSBG · Battlegrounds rankings & season history
 
-A small, open-source lookup tool for public Hearthstone Battlegrounds **MMR and regional leaderboard rank**. Paste a few BattleTags, choose Solo or Duos, a region, and a season to get a quick read on a lobby.
+**[Open HSBG → hsbg.win](https://hsbg.win)**
 
-> MMR is the number. Leaderboard rank is the context: a player at #100 Europe and one at #500 Americas tell very different stories.
+HSBG is an independent community tool for looking up public Hearthstone Battlegrounds **MMR, regional rank and season history**, with coverage beyond the top 100.
 
-**Live site:** [mmrbg.duckdns.org](https://mmrbg.duckdns.org)
+Search one player across the available archived seasons, or compare up to 20 player names in a selected leaderboard. No account or Battle.net login is required.
 
-## What it does
+## What you can explore
 
-- Looks up up to 20 BattleTags at once.
-- Shows both a player's MMR and their position on the selected regional leaderboard.
-- Supports Battlegrounds Solo and Battlegrounds Duos.
-- Supports Europe, Americas, and Asia-Pacific.
-- Shows every archived season, from Season 1 onward, alongside the live current season.
-- Includes an optional one-player season-history search for the selected mode and region. Completed seasons are searched locally; only the current season touches Blizzard.
-- Uses Blizzard's public leaderboard endpoint; it does not request a Battle.net login or store player data.
+- **Solo and Duos**, across **Europe, Americas and Asia-Pacific**.
+- A player's rating and position in the selected regional leaderboard.
+- Available past seasons for the chosen mode and region.
+- The latest saved current-season leaderboard, with its capture time.
+- Links to community resources, trackers and other independent Battlegrounds tools.
 
-## Project layout
+## Data coverage and freshness
 
-- `backend.py` — FastAPI service that retrieves and searches the public leaderboard.
-- `index.html` — the responsive, single-page interface served by the API.
-- `archive_leaderboards.py` — a resumable, server-only builder for completed-season archives.
-- `archives/` — generated local archives (ignored by Git, except its documentation).
-- `requirements.txt` — Python dependencies.
+HSBG uses Blizzard's public leaderboard data. Public player names, ratings and ranks are stored on the server for searches.
 
-## Run locally
+Historical archives generally cover ratings **above 8,000 MMR**. Coverage depends on the season and the available public data; not every player or season is represented. A missing result does not prove that a player has never played or has no rating. Names without a BattleTag discriminator may be ambiguous.
 
-Requires Python 3.10 or newer.
+On the production website, searches use local archives and snapshots: **a visitor's search does not trigger a Blizzard request**.
+
+Current leaderboards are scheduled for refresh every 30 minutes, staggered as follows (UTC):
+
+| Leaderboard | Minutes past each hour |
+| --- | --- |
+| Europe Solo | 00, 30 |
+| Europe Duos | 05, 35 |
+| Americas Solo | 10, 40 |
+| Americas Duos | 15, 45 |
+| Asia-Pacific Solo | 20, 50 |
+| Asia-Pacific Duos | 25, 55 |
+
+These are scheduled start times, not guarantees of freshness. A failed capture preserves the previous complete snapshot. Check the timestamp displayed with results.
+
+The production search limit is **10 searches per minute per IP**, shared between regular and season-history searches.
+
+## Source and deployment status
+
+The live site has received updates that have not all been synchronized to this repository yet, including the tavern design and branding, snapshot-only searches and additional service isolation. This README describes the current production behavior; the checked-in code may still use the earlier live-search implementation and older defaults.
+
+Server-side Nginx, Cloudflare and systemd configuration is also part of the deployment. Reading the frontend alone does not describe all deployed security controls.
+
+## Run the checked-in application locally
+
+Use **Python 3.11 or newer**.
 
 ```bash
-git clone https://github.com/oriolcot/HSMMR.git
-cd HSMMR
+git clone https://github.com/oriolcot/HSMMR.git HSBG
+cd HSBG
 python -m venv .venv
 ```
 
@@ -46,62 +65,33 @@ Activate the environment:
 source .venv/bin/activate
 ```
 
-Install and start the app:
+Install dependencies and start the local server:
 
 ```bash
 pip install -r requirements.txt
-uvicorn backend:app --reload
+uvicorn backend:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+Open [localhost:8000](http://127.0.0.1:8000). Historical data files are not included in a fresh clone. Review the checked-in archive builder's options with `python archive_leaderboards.py --help` before downloading data. Avoid running multiple importers concurrently.
 
-## Configuration
+## Production architecture and security
 
-The service is safe to run with its defaults. These optional environment variables are useful for a deployment:
+The public website uses Cloudflare in front of Nginx. HTTP redirects to HTTPS; the origin also has a Let's Encrypt certificate. The frontend calls the API on the same origin.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `CORS_ALLOWED_ORIGINS` | Localhost only | Comma-separated web origins allowed to call the API. |
-| `MAX_PAGES_TO_SCAN` | `40` | Number of leaderboard pages checked for each lookup. |
-| `MAX_WORKERS` | `8` | Maximum concurrent leaderboard requests. |
-| `RATE_LIMIT_REQUESTS` | `2` | Searches allowed per IP during the rate-limit window. This is shared by normal and season-history searches. |
-| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window in seconds. |
-| `CAREER_CACHE_SECONDS` | `21600` | How long a completed season-history search is cached. |
-| `TRUSTED_IPS` | Empty | Comma-separated administrator IPs exempt from this app's rate limits. Set this only in the server environment, never in the repository. |
-| `MAX_CONCURRENT_SEARCHES` | `2` | Total Blizzard-bound searches allowed at once across every visitor. |
-| `SEARCH_QUEUE_WAIT_SECONDS` | `180` | Longest wait for a normal lookup before the service asks the visitor to retry. |
+Uvicorn listens only on loopback. The web service runs as a dedicated non-administrator user with read-only access to the necessary application files and leaderboard data. A separate collector can write only the current snapshots.
 
-For a GitHub Pages front end, set:
+Additional deployed protections include validated search inputs, bounded caches and history jobs, request and resource limits, and browser security headers. Player results are rendered as text, rather than inserted as HTML.
 
-```bash
-CORS_ALLOWED_ORIGINS=https://oriolcot.github.io
-```
+The current Content Security Policy restricts framing, embedded objects and base URLs. It is **not yet a strict script policy**: the interface still contains inline JavaScript and CSS.
 
-## Deployment notes
+These controls reduce risk; they do not guarantee that the application, dependencies or hosting infrastructure are vulnerability-free. Never enter passwords, access tokens or other secrets into the player search.
 
-The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443. Season-history searches run in the background and report progress through short status requests.
+## Analytics and support
 
-## Building the historic archive
+The public site uses Cloudflare Web Analytics for usage and performance statistics.
 
-Run this **once on the Oracle server** after deploying the source update. It downloads every completed season for Europe, Americas, Asia-Pacific, Solo and Duos, one page at a time. It skips files already completed, so it is safe to restart after a disconnect or temporary Blizzard error.
-
-```bash
-cd ~/hsmmr
-nohup .venv/bin/python archive_leaderboards.py --delay 1.0 > archive-build.log 2>&1 &
-```
-
-The initial archive takes a while by design. Follow its progress with:
-
-```bash
-tail -f ~/hsmmr/archive-build.log
-```
-
-Do not use proxies or parallel copies of the importer. The one-second pause and sequential requests keep the initial capture gentle; afterwards completed seasons are served locally with no Blizzard request at all.
-
-## Support
-
-The project may include an optional Buy Me a Coffee link to help cover hosting costs. It is never required to use the scanner.
+Optional support: [Buy Me a Coffee](https://buymeacoffee.com/urycot). Donations are not required to search.
 
 ## Disclaimer
 
-This is an independent community project. It is not affiliated with or endorsed by Blizzard Entertainment. Hearthstone is a trademark or registered trademark of Blizzard Entertainment, Inc. in the U.S. and/or other countries. All third-party services linked from the site belong to their respective owners.
+HSBG is not affiliated with or endorsed by Blizzard Entertainment. Hearthstone is a trademark or registered trademark of Blizzard Entertainment, Inc. Linked third-party services and their logos belong to their respective owners.
