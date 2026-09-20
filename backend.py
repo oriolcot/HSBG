@@ -41,6 +41,9 @@ APP_DIR = Path(__file__).resolve().parent
 app.mount("/assets", StaticFiles(directory=APP_DIR / "assets"), name="assets")
 ARCHIVE_DIR = APP_DIR / "archives"
 SNAPSHOT_DIR = APP_DIR / "current_leaderboards"
+DATA_MODE = os.getenv("HSBG_DATA_MODE", "snapshot").lower()
+if DATA_MODE not in {"snapshot", "live"}:
+    raise ValueError("HSBG_DATA_MODE must be snapshot or live")
 SEASON_CACHE_SECONDS = 600
 RESULT_CACHE_SECONDS = 600
 CAREER_CACHE_SECONDS = int(os.getenv("CAREER_CACHE_SECONDS", "21600"))
@@ -48,8 +51,8 @@ MAX_CACHE_ENTRIES = 500
 MAX_RATE_LIMIT_CLIENTS = 10000
 MAX_RETAINED_CAREER_JOBS = 500
 MAX_TAGS_PER_REQUEST = 20
-MAX_PAGES_TO_SCAN = int(os.getenv("MAX_PAGES_TO_SCAN", "0"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+MAX_PAGES_TO_SCAN = int(os.getenv("MAX_PAGES_TO_SCAN", "40" if DATA_MODE == "live" else "0"))
+MAX_WORKERS = max(1, min(4, int(os.getenv("MAX_WORKERS", "4"))))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 CAREER_JOB_TTL_SECONDS = int(os.getenv("CAREER_JOB_TTL_SECONDS", "3600"))
@@ -291,7 +294,26 @@ def store_career_result(key, value):
                 _career_cache.pop(next(iter(_career_cache)))
         _career_cache[key] = {"value": value, "expires_at": now + min(CAREER_CACHE_SECONDS, RESULT_CACHE_SECONDS)}
 
+@queued_search
+def discover_live_season(region, mode):
+    try:
+        data = blizzard_get({"region": region, "leaderboardId": mode, "page": "1"})
+        return int(data["seasonId"])
+    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=503, detail="Blizzard is unavailable. Please retry later.") from error
+
+
 def get_current_season(region: str, mode: str) -> int:
+    if DATA_MODE == "live":
+        key = (region, mode)
+        with _lock:
+            cached = _season_cache.get(key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        season = discover_live_season(region, mode)
+        with _lock:
+            _season_cache[key] = (time.monotonic() + SEASON_CACHE_SECONDS, season)
+        return season
     snapshot = load_current_snapshot(region, mode, None)
     if not snapshot:
         raise HTTPException(status_code=503, detail="Current leaderboard snapshot is unavailable. Please try again later.")
@@ -390,22 +412,33 @@ def find_live_players(tags, params):
     if pending and total_pages > 1:
         pages = preferred_live_pages(pending, region, mode, season, total_pages)
         if MAX_PAGES_TO_SCAN > 0:
+            incomplete = incomplete or total_pages > MAX_PAGES_TO_SCAN
             pages = islice(pages, max(0, MAX_PAGES_TO_SCAN - 1))
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             while pending:
                 batch = list(islice(pages, MAX_WORKERS))
                 if not batch:
                     break
-                futures = [executor.submit(fetch_page, page, params) for page in batch]
+                pending_batch_failed = False
+                futures = []
+                for page in batch:
+                    if DATA_MODE == "live":
+                        time.sleep(0.25)
+                    futures.append(executor.submit(fetch_page, page, params))
                 for future in futures:
                     page, rows = future.result()
                     if rows is None:
                         incomplete = True
+                        if DATA_MODE == "live":
+                            # Stop this lookup on upstream errors instead of continuing to hammer pages.
+                            pending_batch_failed = True
                     else:
                         consume(rows, page)
+                if pending_batch_failed:
+                    break
     return [found.get(tag, {"btag": tag, "found": False,
              "incomplete": incomplete,
-             "error": ("Some leaderboard pages were unavailable. Please retry."
+             "error": ("Lookup incomplete: the page limit was reached or some pages were unavailable."
                        if incomplete else "Not found in the current public leaderboard")}) for tag in tags]
 
 
@@ -444,6 +477,7 @@ def seasons(mode: str = "battlegrounds", region: str = "US"):
     )
     return {
         "currentSeason": current_season,
+        "dataMode": DATA_MODE,
         "seasons": all_seasons,
     }
 
@@ -482,6 +516,8 @@ def search_players(
         raise HTTPException(status_code=400, detail="One or more BattleTags have an invalid format.")
 
     if season_id == current_season:
+        if DATA_MODE == "live":
+            return search_live_players(tags_introduits, mode, region, season_id, None)
         snapshot = load_current_snapshot(region, mode, current_season)
         if not snapshot:
             raise HTTPException(status_code=503, detail="Current leaderboard snapshot is unavailable.")
@@ -521,8 +557,9 @@ def search_live_players(tags_introduits, mode, region, season_id, cache_key):
             "region": region, "leaderboardId": mode, "seasonId": str(season_id)})
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.") from error
-    if not any(player.get("incomplete") for player in response):
-        store_result(cache_key, response)
+    checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for player in response:
+        player.update(dataMode="live", checkedAt=checked_at)
     return response
 
 
@@ -548,10 +585,12 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
     """Publish local history before waiting for or scanning the live season."""
     started = time.monotonic()
     matches, unavailable, scanned = [], [], []
+    checked_at = None
 
     def result():
         return {"btag": tag, "mode": mode, "region": region,
-                "currentSeason": current_season, "capturedAt": (load_current_snapshot(region, mode, current_season) or {}).get("capturedAt"), "scannedSeasons": list(scanned),
+                "currentSeason": current_season, "dataMode": DATA_MODE, "checkedAt": checked_at,
+                "capturedAt": None if DATA_MODE == "live" else (load_current_snapshot(region, mode, current_season) or {}).get("capturedAt"), "scannedSeasons": list(scanned),
                 "unavailableSeasons": list(unavailable),
                 "matches": sorted(matches, key=lambda match: match["season"], reverse=True),
                 "elapsedSeconds": round(time.monotonic() - started, 1)}
@@ -577,7 +616,17 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
                                        current_season=current_season, result=partial)
         if current_season in seasons_to_scan:
             snapshot = load_current_snapshot(region, mode, current_season)
-            if snapshot:
+            if DATA_MODE == "live":
+                try:
+                    player = search_live_players([tag], mode, region, current_season, None)[0]
+                    checked_at = player.get("checkedAt")
+                    if player.get("found"):
+                        matches.append({"season": current_season, **player})
+                    elif player.get("incomplete"):
+                        unavailable.append(current_season)
+                except HTTPException:
+                    unavailable.append(current_season)
+            elif snapshot:
                 player = find_player_in_rows(tag, snapshot["rows"])
                 if player:
                     matches.append({"season": current_season, **player})
@@ -585,7 +634,7 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
                 unavailable.append(current_season)
             scanned.append(current_season)
         final = result()
-        if not unavailable:
+        if not unavailable and DATA_MODE != "live":
             store_career_result(cache_key, final)
         with _lock:
             _career_jobs[job_id].update(status="completed", completed_seasons=len(scanned),
@@ -628,7 +677,7 @@ def start_career_search(
     )
     cache_key = (tag.lower(), mode, region, current_season,
                  (load_current_snapshot(region, mode, current_season) or {}).get("capturedAt"))
-    cached = cached_career_result(cache_key)
+    cached = cached_career_result(cache_key) if DATA_MODE != "live" else None
     if cached is not None:
         return {"status": "completed", "result": cached}
 

@@ -19,3 +19,11 @@ const fn = html.split('\n').find(line => line.includes('async function waitForCa
   assert.match(context.status.textContent,/Historical results ready/);
   console.log('PASS: UI displays partial history while queued and running, then returns final result');
 })().catch(error=>{console.error(error);process.exitCode=1;});
+const freshness = html.split('\n').filter(line => line.includes('function resultFreshness(') || line.includes('function snapshotLabel(')).join('\n');
+const freshnessContext = {};
+vm.createContext(freshnessContext);
+vm.runInContext(freshness, freshnessContext);
+assert.match(freshnessContext.resultFreshness({dataMode:'live',checkedAt:'2026-01-01T00:00:00Z'}), /^Blizzard checked:/);
+assert.match(freshnessContext.resultFreshness({capturedAt:'2026-01-01T00:00:00Z'}), /^Current leaderboard updated:/);
+assert.equal(freshnessContext.resultFreshness(undefined), '');
+console.log('PASS: freshness labels distinguish direct lookups from saved snapshots');

@@ -9,6 +9,8 @@
 
 ---
 
+**[Installation, live mode and hosting guides](docs/wiki/Home.md)**
+
 ## Find your place in the tavern
 
 Look up a player across available past seasons, or compare up to 20 player names in a selected leaderboard. **No account. No Battle.net login.**
@@ -87,7 +89,7 @@ pip install -r requirements.txt
 uvicorn backend:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open [localhost:8000](http://127.0.0.1:8000). A fresh clone contains no leaderboard data. The interface loads, but searches need local snapshots or archives.
+Open [localhost:8000](http://127.0.0.1:8000). A fresh clone contains no leaderboard data. Snapshot mode needs local data; for an on-demand current-season lookup without downloads, see [live mode](docs/wiki/Live-mode.md). Set `HSBG_DATA_MODE=live` before starting the API. Historical seasons still need archives.
 
 To capture the six current leaderboards (this contacts Blizzard and may take several minutes):
 
