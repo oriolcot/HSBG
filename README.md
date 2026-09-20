@@ -1,18 +1,23 @@
-# HSBG · Battlegrounds rankings & season history
+<p align="center">
+  <a href="https://hsbg.win"><img src="assets/branding/bg-256.png" width="112" height="112" alt="HSBG logo"></a>
+</p>
 
-**[Open HSBG → hsbg.win](https://hsbg.win)**
+<h1 align="center">HSBG</h1>
+<p align="center"><strong>Your climb. Across the seasons.</strong></p>
+<p align="center">Battlegrounds ratings, regional rankings and season history.<br>Explore beyond the top 100.</p>
+<p align="center"><a href="https://hsbg.win"><strong>Open HSBG ↗</strong></a> · <a href="#development">Development</a> · <a href="SECURITY.md">Security</a></p>
 
-HSBG is an independent community tool for looking up public Hearthstone Battlegrounds **MMR, regional rank and season history**, with coverage beyond the top 100.
+---
 
-Search one player across the available archived seasons, or compare up to 20 player names in a selected leaderboard. No account or Battle.net login is required.
+## Find your place in the tavern
 
-## What you can explore
+Look up a player across available past seasons, or compare up to 20 player names in a selected leaderboard. **No account. No Battle.net login.**
 
-- **Solo and Duos**, across **Europe, Americas and Asia-Pacific**.
-- A player's rating and position in the selected regional leaderboard.
-- Available past seasons for the chosen mode and region.
-- The latest saved current-season leaderboard, with its capture time.
-- Links to community resources, trackers and other independent Battlegrounds tools.
+| Find a player | Explore their history | Choose your leaderboard |
+| --- | --- | --- |
+| Public MMR and regional rank | Available archived seasons | Solo & Duos · Europe, Americas & Asia-Pacific |
+
+Current results show the latest snapshot's capture time. Historical coverage generally starts above **8,000 MMR**; not every player or season is available.
 
 ## Data coverage and freshness
 
@@ -37,13 +42,23 @@ These are scheduled start times, not guarantees of freshness. A failed capture p
 
 The production search limit is **10 searches per minute per IP**, shared between regular and season-history searches.
 
-## Source and deployment status
+<a id="development"></a>
+<details>
+<summary><strong>Development · local setup and tests</strong></summary>
 
-The live site has received updates that have not all been synchronized to this repository yet, including the tavern design and branding, snapshot-only searches and additional service isolation. This README describes the current production behavior; the checked-in code may still use the earlier live-search implementation and older defaults.
+## Project layout
 
-Server-side Nginx, Cloudflare and systemd configuration is also part of the deployment. Reading the frontend alone does not describe all deployed security controls.
+- `backend.py`: FastAPI search API and same-origin frontend serving.
+- `index.html`: responsive HSBG interface.
+- `assets/branding/`: logo, browser icons and background textures.
+- `archive_leaderboards.py`: resumable completed-season archive builder.
+- `refresh_current.py`: current leaderboard snapshot collector.
+- `tests/`: API behavior, resource-limit and history UI checks.
+- `archives/` and `current_leaderboards/`: generated data, excluded from Git.
 
-## Run the checked-in application locally
+Private production configuration is intentionally excluded. See [SECURITY.md](SECURITY.md) for deployment guidance and responsible reporting.
+
+## Run locally
 
 Use **Python 3.11 or newer**.
 
@@ -72,13 +87,35 @@ pip install -r requirements.txt
 uvicorn backend:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open [localhost:8000](http://127.0.0.1:8000). Historical data files are not included in a fresh clone. Review the checked-in archive builder's options with `python archive_leaderboards.py --help` before downloading data. Avoid running multiple importers concurrently.
+Open [localhost:8000](http://127.0.0.1:8000). A fresh clone contains no leaderboard data. The interface loads, but searches need local snapshots or archives.
+
+To capture the six current leaderboards (this contacts Blizzard and may take several minutes):
+
+```bash
+python refresh_current.py
+```
+
+The collector uses a Linux/POSIX file lock; on Windows, run it in WSL. `python refresh_current.py --scheduled` refreshes just the board assigned to the current UTC time slot. To refresh continuously, arrange for that command to run every five minutes using your own scheduler.
+
+For historical data, review `python archive_leaderboards.py --help`. For example, build a single completed season with `--region EU --mode battlegrounds --start-season N --end-season N`, replacing `N` with the upstream season ID. These IDs may differ from Blizzard's publicly named season numbers. The default historical threshold is strictly above 8,000 MMR. Do not run multiple importers concurrently.
+
+## Validation
+
+```bash
+python -m unittest discover -s tests -v
+node tests/test_history_ui.cjs
+```
+
+Tests require no live Blizzard requests. Node.js is needed only for the frontend test.
 
 ## Security
 
 HSBG does not ask for Battle.net credentials. Search inputs are validated and player results are rendered as text. Request limits help reduce abuse.
 
 Private hosting configuration, credentials, operational logs and local data files are not part of the public source distribution. Security controls reduce risk but cannot guarantee that a service is vulnerability-free. Never enter passwords or access tokens into the player search.
+
+
+</details>
 
 ## Analytics and support
 

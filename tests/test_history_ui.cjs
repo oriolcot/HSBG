@@ -1,0 +1,21 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const html = fs.readFileSync('index.html', 'utf8');
+const fn = html.split('\n').find(line => line.includes('async function waitForCareerResult(jobId)'));
+(async () => {
+  const partial = {matches:[{season:18}],scannedSeasons:[18],unavailableSeasons:[]};
+  const final = {...partial,scannedSeasons:[18,19]};
+  const messages = [{status:'queued',result:partial},{status:'running',result:partial},{status:'completed',result:final}];
+  const renders = [];
+  const context = {API_BASE_URL:'',wait:async()=>{},status:{textContent:''},
+    renderCareerResults:(result,pending)=>renders.push({result,pending}),
+    fetch:async()=>({ok:true,json:async()=>messages.shift()})};
+  vm.createContext(context);vm.runInContext(fn,context);
+  const result = await context.waitForCareerResult('test');
+  assert.equal(result,final);
+  assert.equal(renders.length,2);
+  assert.ok(renders.every(r=>r.pending && r.result===partial));
+  assert.match(context.status.textContent,/Historical results ready/);
+  console.log('PASS: UI displays partial history while queued and running, then returns final result');
+})().catch(error=>{console.error(error);process.exitCode=1;});

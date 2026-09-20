@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="960" viewBox="0 0 640 960">
+<filter color-interpolation-filters="sRGB" id="wood" x="0" y="0" width="100%" height="100%">
+<feTurbulence type="fractalNoise" baseFrequency=".045 .0025" numOctaves="3" seed="14" stitchTiles="stitch"/>
+<feColorMatrix type="saturate" values="0"/>
+<feComponentTransfer><feFuncR type="linear" slope=".14" intercept=".08"/><feFuncG type="linear" slope=".095" intercept=".047"/><feFuncB type="linear" slope=".06" intercept=".028"/></feComponentTransfer>
+</filter><path fill="#281b12" d="M0 0h640v960H0z"/><path filter="url(#wood)" d="M0 0h640v960H0z"/>
+</svg>

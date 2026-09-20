@@ -4,9 +4,10 @@ __pycache__/
 .env
 archives/**/*.json
 
-# Private deployment configuration and operational data
+current_leaderboards/
+
+# Local deployment details and private operational files
 /deploy/
-/current_leaderboards/
 *.log
 .env.*
 !.env.example
@@ -15,3 +16,7 @@ archives/**/*.json
 *.p12
 *.pfx
 /backups/
+
+# Local artwork working masters (exported web assets are public)
+/assets/branding/bg-logo.png
+/assets/branding/bg-icon-master.png

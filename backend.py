@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import concurrent.futures
@@ -7,13 +8,14 @@ import json
 import os
 import re
 import time
+from itertools import islice
 from collections import defaultdict, deque
 from functools import wraps
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import Condition, Lock, Thread, local
 from uuid import uuid4
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 # Example for Oracle:
 # CORS_ALLOWED_ORIGINS=https://oriolcot.github.io
@@ -36,15 +38,19 @@ app.add_middleware(
 # the redirect and returns the current season in the top-level `seasonId` field.
 BASE_URL = "https://hearthstone.blizzard.com/en-us/api/community/leaderboardsData"
 APP_DIR = Path(__file__).resolve().parent
+app.mount("/assets", StaticFiles(directory=APP_DIR / "assets"), name="assets")
 ARCHIVE_DIR = APP_DIR / "archives"
+SNAPSHOT_DIR = APP_DIR / "current_leaderboards"
 SEASON_CACHE_SECONDS = 600
 RESULT_CACHE_SECONDS = 600
 CAREER_CACHE_SECONDS = int(os.getenv("CAREER_CACHE_SECONDS", "21600"))
 MAX_CACHE_ENTRIES = 500
+MAX_RATE_LIMIT_CLIENTS = 10000
+MAX_RETAINED_CAREER_JOBS = 500
 MAX_TAGS_PER_REQUEST = 20
-MAX_PAGES_TO_SCAN = int(os.getenv("MAX_PAGES_TO_SCAN", "40"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "2"))
+MAX_PAGES_TO_SCAN = int(os.getenv("MAX_PAGES_TO_SCAN", "0"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 CAREER_JOB_TTL_SECONDS = int(os.getenv("CAREER_JOB_TTL_SECONDS", "3600"))
 MAX_CONCURRENT_SEARCHES = int(os.getenv("MAX_CONCURRENT_SEARCHES", "2"))
@@ -67,9 +73,11 @@ _season_cache = {}
 _result_cache = {}
 _career_cache = {}
 _request_times = defaultdict(list)
-_career_scan_lock = Lock()
 _career_jobs = {}
 _archive_cache = {}
+_snapshot_cache = {}
+_live_hints = {}
+_http_local = local()
 _search_condition = Condition(Lock())
 _search_queue = deque()
 _active_searches = 0
@@ -81,7 +89,10 @@ class SearchQueueTimeout(Exception):
 
 def blizzard_get(params: dict, timeout: int = 10) -> dict:
     """Make a controlled request to Blizzard and validate the response."""
-    response = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=timeout)
+    if not hasattr(_http_local, "session"):
+        _http_local.session = requests.Session()
+        _http_local.session.headers.update(HEADERS)
+    response = _http_local.session.get(BASE_URL, params=params, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict) or "leaderboard" not in data:
@@ -218,6 +229,14 @@ def queued_search(function):
 def client_is_rate_limited(ip: str) -> bool:
     now = time.monotonic()
     with _lock:
+        # Prune inactive clients and bound memory under high-cardinality traffic.
+        if ip not in _request_times and len(_request_times) >= MAX_RATE_LIMIT_CLIENTS:
+            stale = [key for key, times in _request_times.items()
+                     if not times or now - times[-1] >= RATE_LIMIT_WINDOW_SECONDS]
+            for key in stale:
+                del _request_times[key]
+            if len(_request_times) >= MAX_RATE_LIMIT_CLIENTS:
+                return True
         recent = [t for t in _request_times[ip] if now - t < RATE_LIMIT_WINDOW_SECONDS]
         if len(recent) >= RATE_LIMIT_REQUESTS:
             _request_times[ip] = recent
@@ -270,77 +289,131 @@ def store_career_result(key, value):
                 del _career_cache[expired_key]
             if len(_career_cache) >= MAX_CACHE_ENTRIES:
                 _career_cache.pop(next(iter(_career_cache)))
-        _career_cache[key] = {"value": value, "expires_at": now + CAREER_CACHE_SECONDS}
+        _career_cache[key] = {"value": value, "expires_at": now + min(CAREER_CACHE_SECONDS, RESULT_CACHE_SECONDS)}
 
 def get_current_season(region: str, mode: str) -> int:
-    """Fetch and cache the current season for the selected region and mode."""
-    now = time.monotonic()
-    cache_key = (region, mode)
-    with _lock:
-        cached = _season_cache.get(cache_key)
-        if cached and cached["expires_at"] > now:
-            return cached["value"]
-    try:
-        data = blizzard_get({'region': region, 'leaderboardId': mode}, timeout=5)
-        season_id = int(data['seasonId'])
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.")
+    snapshot = load_current_snapshot(region, mode, None)
+    if not snapshot:
+        raise HTTPException(status_code=503, detail="Current leaderboard snapshot is unavailable. Please try again later.")
+    return int(snapshot["season"])
 
-    with _lock:
-        _season_cache[cache_key] = {"value": season_id, "expires_at": now + SEASON_CACHE_SECONDS}
-    return season_id
+def load_current_snapshot(region, mode, season):
+    path = SNAPSHOT_DIR / f"{region}-{mode}.json"
+    try:
+        modified = path.stat().st_mtime_ns
+        key = (region, mode)
+        with _lock:
+            cached = _snapshot_cache.get(key)
+        if cached and cached[0] == modified:
+            data = cached[1]
+        else:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data.get("rows"), list):
+                return None
+            with _lock:
+                _snapshot_cache[key] = (modified, data)
+        if ((season is not None and data.get("season") != season) or data.get("region") != region
+                or data.get("mode") != mode):
+            return None
+        return data
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def preferred_live_pages(tags, region, mode, season, total_pages):
+    """Try saved rank neighborhoods, then scan the remainder from the bottom."""
+    snapshot = load_current_snapshot(region, mode, season)
+    hints = []
+    for tag in tags:
+        with _lock:
+            known = _live_hints.get((region, mode, season, tag.lower()))
+        if not known and snapshot:
+            known = find_player_in_rows(tag, snapshot["rows"])
+        if not known and not snapshot:
+            for old_season in available_archived_seasons(region, mode):
+                if old_season >= season:
+                    continue
+                known = find_player_in_rows(tag, load_archive_rows(region, mode, old_season) or [])
+                if known:
+                    break
+        if known and isinstance(known.get("rank"), int):
+            hints.append(max(1, min(total_pages, (known["rank"] - 1) // 25 + 1)))
+    seen = {1}  # Page one was already fetched to obtain current pagination.
+    for offset in (0, -1, 1, -2, 2):
+        for center in hints:
+            page = center + offset
+            if 1 <= page <= total_pages and page not in seen:
+                seen.add(page)
+                yield page
+    for page in range(total_pages, 1, -1):
+        if page not in seen:
+            yield page
+
 
 def fetch_page(page: int, params: dict):
-    """Fetch one page without failing the full lookup on a network error."""
-    p = params.copy()
-    p['page'] = str(page)
     try:
-        data = blizzard_get(p)
-        return page, data.get('leaderboard', {}).get('rows', [])
-    except (requests.RequestException, ValueError):
-        return page, []
+        data = blizzard_get({**params, "page": str(page)})
+        if int(data["seasonId"]) != int(params["seasonId"]):
+            raise ValueError("Season changed")
+        return page, data["leaderboard"]["rows"]
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return page, None
+
+
+def find_live_players(tags, params):
+    region, mode, season = params["region"], params["leaderboardId"], int(params["seasonId"])
+    try:
+        first = blizzard_get({**params, "page": "1"}, timeout=6)
+        if int(first["seasonId"]) != season:
+            raise ValueError("Season changed")
+        board = first["leaderboard"]
+        total_pages = int(board["pagination"]["totalPages"])
+        first_rows = board["rows"]
+    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError("Blizzard did not return this season's leaderboard") from error
+    found = {}
+    pending = list(dict.fromkeys(tags))
+    incomplete = False
+
+    def consume(rows, page):
+        for tag in list(pending):
+            player = find_player_in_rows(tag, rows, page)
+            if player:
+                found[tag] = {"found": True, **player}
+                pending.remove(tag)
+                with _lock:
+                    if len(_live_hints) >= MAX_CACHE_ENTRIES:
+                        _live_hints.pop(next(iter(_live_hints)))
+                    _live_hints[(region, mode, season, tag.lower())] = player
+
+    consume(first_rows, 1)
+    if pending and total_pages > 1:
+        pages = preferred_live_pages(pending, region, mode, season, total_pages)
+        if MAX_PAGES_TO_SCAN > 0:
+            pages = islice(pages, max(0, MAX_PAGES_TO_SCAN - 1))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            while pending:
+                batch = list(islice(pages, MAX_WORKERS))
+                if not batch:
+                    break
+                futures = [executor.submit(fetch_page, page, params) for page in batch]
+                for future in futures:
+                    page, rows = future.result()
+                    if rows is None:
+                        incomplete = True
+                    else:
+                        consume(rows, page)
+    return [found.get(tag, {"btag": tag, "found": False,
+             "incomplete": incomplete,
+             "error": ("Some leaderboard pages were unavailable. Please retry."
+                       if incomplete else "Not found in the current public leaderboard")}) for tag in tags]
 
 
 def find_player_in_season(tag: str, params: dict):
-    """Find one BattleTag in one season without retaining any player data."""
-    target = tag.lower()
-    name_only = tag.split("#", 1)[0].lower()
-
-    def match_row(rows, page):
-        for row in rows:
-            account_id = str(row.get("accountid", ""))
-            account_lower = account_id.lower()
-            if account_lower == target or account_lower.startswith(name_only):
-                return {
-                    "btag": account_id,
-                    "rank": row.get("rank"),
-                    "rating": row.get("rating"),
-                    "page": page,
-                }
-        return None
-
-    try:
-        first_page = blizzard_get({**params, "page": "1"}, timeout=6)
-        leaderboard = first_page.get("leaderboard", {})
-        total_pages = leaderboard.get("pagination", {}).get("totalPages", 0)
-        found = match_row(leaderboard.get("rows", []), 1)
-    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
-        raise RuntimeError("Blizzard did not return this season's leaderboard") from error
-
-    if found or total_pages <= 1:
-        return found
-
-    pages_to_scan = min(total_pages, MAX_PAGES_TO_SCAN)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for page_start in range(2, pages_to_scan + 1, MAX_WORKERS):
-            pages = range(page_start, min(page_start + MAX_WORKERS, pages_to_scan + 1))
-            futures = [executor.submit(fetch_page, page, params) for page in pages]
-            for future in concurrent.futures.as_completed(futures):
-                page, rows = future.result()
-                found = match_row(rows, page)
-                if found:
-                    return found
-    return None
+    result = find_live_players([tag], params)[0]
+    if result.get("incomplete"):
+        raise RuntimeError("Some leaderboard pages were unavailable")
+    return result if result["found"] else None
 
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
@@ -376,7 +449,6 @@ def seasons(mode: str = "battlegrounds", region: str = "US"):
 
 
 @app.get("/buscar")
-@queued_search
 def search_players(
     request: Request,
     btags: str,
@@ -409,13 +481,24 @@ def search_players(
     if invalid_tags:
         raise HTTPException(status_code=400, detail="One or more BattleTags have an invalid format.")
 
+    if season_id == current_season:
+        snapshot = load_current_snapshot(region, mode, current_season)
+        if not snapshot:
+            raise HTTPException(status_code=503, detail="Current leaderboard snapshot is unavailable.")
+        response = archived_player_results(tags_introduits, snapshot["rows"])
+        for player in response:
+            player["capturedAt"] = snapshot["capturedAt"]
+            if not player.get("found"):
+                player["error"] = "Not found in the latest leaderboard snapshot"
+        return response
+
     cache_key = (tuple(sorted(tag.lower() for tag in tags_introduits)), mode, region, season_id)
     cached = cached_result(cache_key)
     if cached is not None:
         return cached
 
     # Every completed season is immutable and is served from the local archive.
-    # The current season remains live, so fresh MMR and rank are never stale.
+    # Current-season searches return the timestamped local snapshot above.
     if season_id != current_season:
         rows = load_archive_rows(region, mode, season_id)
         if rows is None:
@@ -427,68 +510,19 @@ def search_players(
         store_result(cache_key, response)
         return response
 
-    params = {'region': region, 'leaderboardId': mode, 'seasonId': str(season_id)}
-    
-    objectius = []
-    for tag in tags_introduits:
-        objectius.append({
-            "original": tag,
-            "lower": tag.lower(),
-            "name_only": tag.split('#')[0].lower()
-        })
-        
-    resultats = {obj["original"]: {"btag": obj["original"], "found": False, "error": "Not found (outside the scanned leaderboard)"} for obj in objectius}
-    objectius_pendents = objectius.copy()
+    return search_live_players(tags_introduits, mode, region, season_id, cache_key)
 
+
+@queued_search
+def search_live_players(tags_introduits, mode, region, season_id, cache_key):
+    """Verify current scores live, using local snapshots only as search hints."""
     try:
-        data = blizzard_get({**params, 'page': '1'})
-        total_pages = data.get('leaderboard', {}).get('pagination', {}).get('totalPages', 0)
-        rows_p1 = data.get('leaderboard', {}).get('rows', [])
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.")
-
-    def check_players_on_page(rows, num_pag):
-        nonlocal objectius_pendents
-        trobat_algun = False
-        for row in rows:
-            acc_id = row.get('accountid', '')
-            acc_id_lower = acc_id.lower()
-            
-            for obj in list(objectius_pendents):
-                if acc_id_lower == obj["lower"] or acc_id_lower.startswith(obj["name_only"]):
-                    resultats[obj["original"]] = {
-                        "btag": acc_id,
-                        "rank": row.get('rank'),
-                        "rating": row.get('rating'),
-                        "found": True,
-                        "page": num_pag
-                    }
-                    objectius_pendents.remove(obj)
-                    trobat_algun = True
-        return trobat_algun
-
-    check_players_on_page(rows_p1, 1)
-
-    if not objectius_pendents or total_pages <= 1:
-        response = list(resultats.values())
+        response = find_live_players(tags_introduits, {
+            "region": region, "leaderboardId": mode, "seasonId": str(season_id)})
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.") from error
+    if not any(player.get("incomplete") for player in response):
         store_result(cache_key, response)
-        return response
-
-    total_a_escanejar = min(total_pages, MAX_PAGES_TO_SCAN)
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for page_start in range(2, total_a_escanejar + 1, MAX_WORKERS):
-            pages = range(page_start, min(page_start + MAX_WORKERS, total_a_escanejar + 1))
-            futures = [executor.submit(fetch_page, page, params) for page in pages]
-            for future in concurrent.futures.as_completed(futures):
-                num_pag, files_pag = future.result()
-                if files_pag:
-                    check_players_on_page(files_pag, num_pag)
-            if not objectius_pendents:
-                break
-                        
-    response = list(resultats.values())
-    store_result(cache_key, response)
     return response
 
 
@@ -502,81 +536,65 @@ def clean_up_career_jobs():
         ]
         for job_id in stale_ids:
             del _career_jobs[job_id]
+        finished = sorted(
+            ((job.get("finished_at", 0), key) for key, job in _career_jobs.items()
+             if job["status"] in {"completed", "failed"})
+        )
+        for _, key in finished[:max(0, len(_career_jobs) - MAX_RETAINED_CAREER_JOBS + 1)]:
+            del _career_jobs[key]
 
 
 def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan, cache_key):
-    """Search archives locally and make exactly one live request for the current season."""
-    search_slot_acquired = False
-    career_lock_acquired = False
-    matches = []
-    unavailable_seasons = []
+    """Publish local history before waiting for or scanning the live season."""
+    started = time.monotonic()
+    matches, unavailable, scanned = [], [], []
+
+    def result():
+        return {"btag": tag, "mode": mode, "region": region,
+                "currentSeason": current_season, "capturedAt": (load_current_snapshot(region, mode, current_season) or {}).get("capturedAt"), "scannedSeasons": list(scanned),
+                "unavailableSeasons": list(unavailable),
+                "matches": sorted(matches, key=lambda match: match["season"], reverse=True),
+                "elapsedSeconds": round(time.monotonic() - started, 1)}
+
     try:
-        _career_scan_lock.acquire()
-        career_lock_acquired = True
-        acquire_search_slot()
-        search_slot_acquired = True
-        started_at = time.monotonic()
         with _lock:
             _career_jobs[job_id]["status"] = "running"
-        for index, season_id in enumerate(seasons_to_scan, start=1):
-            with _lock:
-                _career_jobs[job_id]["completed_seasons"] = index - 1
-                _career_jobs[job_id]["current_season"] = season_id
-            if season_id == current_season:
-                try:
-                    player = find_player_in_season(
-                        tag,
-                        {"region": region, "leaderboardId": mode, "seasonId": str(season_id)},
-                    )
-                except RuntimeError:
-                    unavailable_seasons.append(season_id)
-                    continue
+        for season in seasons_to_scan:
+            if season == current_season:
+                continue
+            rows = load_archive_rows(region, mode, season)
+            if rows is None:
+                unavailable.append(season)
             else:
-                rows = load_archive_rows(region, mode, season_id)
-                if rows is None:
-                    unavailable_seasons.append(season_id)
-                    continue
                 player = find_player_in_rows(tag, rows)
-            if player:
-                matches.append({"season": season_id, **player})
-
-        result = {
-            "btag": tag,
-            "mode": mode,
-            "region": region,
-            "currentSeason": current_season,
-            "scannedSeasons": seasons_to_scan,
-            "unavailableSeasons": unavailable_seasons,
-            "matches": matches,
-            "elapsedSeconds": round(time.monotonic() - started_at, 1),
-        }
-        store_career_result(cache_key, result)
+                if player:
+                    matches.append({"season": season, **player})
+            scanned.append(season)
+        # The frontend can display these matches while live verification is queued.
+        partial = result()
         with _lock:
-            _career_jobs[job_id].update(
-                status="completed",
-                completed_seasons=len(seasons_to_scan),
-                result=result,
-                finished_at=time.monotonic(),
-            )
-    except SearchQueueTimeout:
+            _career_jobs[job_id].update(status="queued", completed_seasons=len(scanned),
+                                       current_season=current_season, result=partial)
+        if current_season in seasons_to_scan:
+            snapshot = load_current_snapshot(region, mode, current_season)
+            if snapshot:
+                player = find_player_in_rows(tag, snapshot["rows"])
+                if player:
+                    matches.append({"season": current_season, **player})
+            else:
+                unavailable.append(current_season)
+            scanned.append(current_season)
+        final = result()
+        if not unavailable:
+            store_career_result(cache_key, final)
         with _lock:
-            _career_jobs[job_id].update(
-                status="failed",
-                detail="The search queue is busy. Please try again later.",
-                finished_at=time.monotonic(),
-            )
+            _career_jobs[job_id].update(status="completed", completed_seasons=len(scanned),
+                                       result=final, finished_at=time.monotonic())
     except Exception:
         with _lock:
-            _career_jobs[job_id].update(
-                status="failed",
+            _career_jobs[job_id].update(status="failed", result=result(),
                 detail="The season-history search stopped unexpectedly. Please try again later.",
-                finished_at=time.monotonic(),
-            )
-    finally:
-        if search_slot_acquired:
-            release_search_slot()
-        if career_lock_acquired:
-            _career_scan_lock.release()
+                finished_at=time.monotonic())
 
 
 @app.get("/career")
@@ -596,22 +614,24 @@ def start_career_search(
     if not tag or not BTAG_PATTERN.fullmatch(tag):
         raise HTTPException(status_code=400, detail="Enter one valid BattleTag.")
 
-    current_season = get_current_season(region, mode)
-    seasons_to_scan = sorted(
-        set(available_archived_seasons(region, mode)) | {current_season},
-        reverse=True,
-    )
-    cache_key = (tag.lower(), mode, region, current_season)
-    cached = cached_career_result(cache_key)
-    if cached is not None:
-        return {"status": "completed", "result": cached}
-
     client_ip = get_client_ip(request)
     if client_ip not in TRUSTED_IPS and client_is_rate_limited(client_ip):
         raise HTTPException(
             status_code=429,
             detail="Too many searches. Please try again in a minute.",
         )
+
+    current_season = get_current_season(region, mode)
+    seasons_to_scan = sorted(
+        set(available_archived_seasons(region, mode)) | {current_season},
+        reverse=True,
+    )
+    cache_key = (tag.lower(), mode, region, current_season,
+                 (load_current_snapshot(region, mode, current_season) or {}).get("capturedAt"))
+    cached = cached_career_result(cache_key)
+    if cached is not None:
+        return {"status": "completed", "result": cached}
+
     clean_up_career_jobs()
     job_id = uuid4().hex
     with _lock:
@@ -668,6 +688,7 @@ def career_search_status(job_id: str):
             "completedSeasons": job["completed_seasons"],
             "currentSeason": job["current_season"],
             "totalSeasons": job["total_seasons"],
+            "result": job.get("result"),
         }
 
 if __name__ == "__main__":
