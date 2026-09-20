@@ -76,7 +76,7 @@ CORS_ALLOWED_ORIGINS=https://oriolcot.github.io
 
 ## Deployment notes
 
-The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443. The season-history lookup can take longer than a standard request, so set `proxy_read_timeout 120s;` and `proxy_send_timeout 120s;` inside the Nginx `location` that proxies to Uvicorn.
+The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443. Season-history searches run in the background and report progress through short status requests, so they do not hold an Nginx request open while scanning.
 
 ## Support
 

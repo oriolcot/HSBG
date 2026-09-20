@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import concurrent.futures
@@ -8,7 +8,8 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from uuid import uuid4
 
 app = FastAPI()
 
@@ -44,6 +45,7 @@ RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "8"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 CAREER_RATE_LIMIT_REQUESTS = int(os.getenv("CAREER_RATE_LIMIT_REQUESTS", "1"))
 CAREER_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("CAREER_RATE_LIMIT_WINDOW_SECONDS", "600"))
+CAREER_JOB_TTL_SECONDS = int(os.getenv("CAREER_JOB_TTL_SECONDS", "3600"))
 BTAG_PATTERN = re.compile(r"^[A-Za-zÀ-ÿ0-9 _.'-]{2,32}(?:#[0-9]{1,8})?$")
 
 # Capçaleres estàndard per evitar qualsevol bloqueig de xarxa
@@ -58,6 +60,7 @@ _career_cache = {}
 _request_times = defaultdict(list)
 _career_request_times = defaultdict(list)
 _career_scan_lock = Lock()
+_career_jobs = {}
 
 
 def blizzard_get(params: dict, timeout: int = 10) -> dict:
@@ -349,14 +352,76 @@ def search_players(
     return response
 
 
+def clean_up_career_jobs():
+    now = time.monotonic()
+    with _lock:
+        stale_ids = [
+            job_id
+            for job_id, job in _career_jobs.items()
+            if job.get("finished_at") and now - job["finished_at"] > CAREER_JOB_TTL_SECONDS
+        ]
+        for job_id in stale_ids:
+            del _career_jobs[job_id]
+
+
+def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
+    """Run the expensive scan outside the web request and keep lightweight progress."""
+    started_at = time.monotonic()
+    matches = []
+    unavailable_seasons = []
+    try:
+        for index, season_id in enumerate(seasons_to_scan, start=1):
+            with _lock:
+                _career_jobs[job_id]["completed_seasons"] = index - 1
+                _career_jobs[job_id]["current_season"] = season_id
+            try:
+                player = find_player_in_season(
+                    tag,
+                    {"region": region, "leaderboardId": mode, "seasonId": str(season_id)},
+                )
+            except RuntimeError:
+                unavailable_seasons.append(season_id)
+                continue
+            if player:
+                matches.append({"season": season_id, **player})
+
+        result = {
+            "btag": tag,
+            "mode": mode,
+            "region": region,
+            "currentSeason": seasons_to_scan[0],
+            "scannedSeasons": seasons_to_scan,
+            "unavailableSeasons": unavailable_seasons,
+            "matches": matches,
+            "elapsedSeconds": round(time.monotonic() - started_at, 1),
+        }
+        store_career_result(cache_key, result)
+        with _lock:
+            _career_jobs[job_id].update(
+                status="completed",
+                completed_seasons=len(seasons_to_scan),
+                result=result,
+                finished_at=time.monotonic(),
+            )
+    except Exception:
+        with _lock:
+            _career_jobs[job_id].update(
+                status="failed",
+                detail="The season-history search stopped unexpectedly. Please try again later.",
+                finished_at=time.monotonic(),
+            )
+    finally:
+        _career_scan_lock.release()
+
+
 @app.get("/career")
-def search_career(
+def start_career_search(
     request: Request,
     btag: str,
     mode: str = "battlegrounds",
     region: str = "US",
 ):
-    """Search every available season for one player in the selected mode only."""
+    """Start a protected all-season search for one player in one mode."""
     if mode not in {"battlegrounds", "battlegroundsduo"}:
         raise HTTPException(status_code=400, detail="Invalid game mode.")
     if region not in {"EU", "US", "AP"}:
@@ -365,15 +430,13 @@ def search_career(
     tag = btag.strip()
     if not tag or not BTAG_PATTERN.fullmatch(tag):
         raise HTTPException(status_code=400, detail="Enter one valid BattleTag.")
-    if "," in tag or "\n" in tag:
-        raise HTTPException(status_code=400, detail="Season history is available for one BattleTag at a time.")
 
     current_season = get_current_season(region, mode)
     seasons_to_scan = list(range(current_season, max(1, current_season - 19) - 1, -1))
     cache_key = (tag.lower(), mode, region, current_season)
     cached = cached_career_result(cache_key)
     if cached is not None:
-        return cached
+        return {"status": "completed", "result": cached}
 
     client_ip = get_client_ip(request)
     if client_is_career_rate_limited(client_ip):
@@ -388,36 +451,55 @@ def search_career(
             detail="A season-history search is already running. Please try again shortly.",
         )
 
-    started_at = time.monotonic()
-    matches = []
-    unavailable_seasons = []
+    clean_up_career_jobs()
+    job_id = uuid4().hex
+    with _lock:
+        _career_jobs[job_id] = {
+            "status": "running",
+            "completed_seasons": 0,
+            "current_season": current_season,
+            "total_seasons": len(seasons_to_scan),
+        }
     try:
-        for season_id in seasons_to_scan:
-            try:
-                player = find_player_in_season(
-                    tag,
-                    {"region": region, "leaderboardId": mode, "seasonId": str(season_id)},
-                )
-            except RuntimeError:
-                unavailable_seasons.append(season_id)
-                continue
-            if player:
-                matches.append({"season": season_id, **player})
-    finally:
+        Thread(
+            target=run_career_search,
+            args=(job_id, tag, mode, region, seasons_to_scan, cache_key),
+            daemon=True,
+        ).start()
+    except Exception as error:
         _career_scan_lock.release()
+        with _lock:
+            del _career_jobs[job_id]
+        raise HTTPException(status_code=503, detail="Unable to start the season-history search.") from error
 
-    response = {
-        "btag": tag,
-        "mode": mode,
-        "region": region,
-        "currentSeason": current_season,
-        "scannedSeasons": seasons_to_scan,
-        "unavailableSeasons": unavailable_seasons,
-        "matches": matches,
-        "elapsedSeconds": round(time.monotonic() - started_at, 1),
-    }
-    store_career_result(cache_key, response)
-    return response
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "running",
+            "jobId": job_id,
+            "completedSeasons": 0,
+            "currentSeason": current_season,
+            "totalSeasons": len(seasons_to_scan),
+        },
+    )
+
+
+@app.get("/career/{job_id}")
+def career_search_status(job_id: str):
+    with _lock:
+        job = _career_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Season-history search not found or expired.")
+        if job["status"] == "completed":
+            return {"status": "completed", "result": job["result"]}
+        if job["status"] == "failed":
+            return {"status": "failed", "detail": job["detail"]}
+        return {
+            "status": "running",
+            "completedSeasons": job["completed_seasons"],
+            "currentSeason": job["current_season"],
+            "totalSeasons": job["total_seasons"],
+        }
 
 if __name__ == "__main__":
     import uvicorn
