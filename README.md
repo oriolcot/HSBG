@@ -12,14 +12,16 @@ A small, open-source lookup tool for public Hearthstone Battlegrounds **MMR and 
 - Shows both a player's MMR and their position on the selected regional leaderboard.
 - Supports Battlegrounds Solo and Battlegrounds Duos.
 - Supports Europe, Americas, and Asia-Pacific.
-- Lets players check Seasons 7 through the current leaderboard season, so ratings are read in the right context.
-- Includes an optional one-player season-history search for the selected mode and region. Results are cached, rate-limited, and queued to protect the public service.
+- Shows every archived season, from Season 1 onward, alongside the live current season.
+- Includes an optional one-player season-history search for the selected mode and region. Completed seasons are searched locally; only the current season touches Blizzard.
 - Uses Blizzard's public leaderboard endpoint; it does not request a Battle.net login or store player data.
 
 ## Project layout
 
 - `backend.py` — FastAPI service that retrieves and searches the public leaderboard.
 - `index.html` — the responsive, single-page interface served by the API.
+- `archive_leaderboards.py` — a resumable, server-only builder for completed-season archives.
+- `archives/` — generated local archives (ignored by Git, except its documentation).
 - `requirements.txt` — Python dependencies.
 
 ## Run locally
@@ -62,11 +64,9 @@ The service is safe to run with its defaults. These optional environment variabl
 | `CORS_ALLOWED_ORIGINS` | Localhost only | Comma-separated web origins allowed to call the API. |
 | `MAX_PAGES_TO_SCAN` | `40` | Number of leaderboard pages checked for each lookup. |
 | `MAX_WORKERS` | `8` | Maximum concurrent leaderboard requests. |
-| `RATE_LIMIT_REQUESTS` | `8` | Requests allowed per IP during the rate-limit window. |
+| `RATE_LIMIT_REQUESTS` | `2` | Searches allowed per IP during the rate-limit window. This is shared by normal and season-history searches. |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window in seconds. |
 | `CAREER_CACHE_SECONDS` | `21600` | How long a completed season-history search is cached. |
-| `CAREER_RATE_LIMIT_REQUESTS` | `1` | Season-history searches allowed per IP during its longer rate-limit window. |
-| `CAREER_RATE_LIMIT_WINDOW_SECONDS` | `600` | Rate-limit window for the expensive season-history search. |
 | `TRUSTED_IPS` | Empty | Comma-separated administrator IPs exempt from this app's rate limits. Set this only in the server environment, never in the repository. |
 | `MAX_CONCURRENT_SEARCHES` | `2` | Total Blizzard-bound searches allowed at once across every visitor. |
 | `SEARCH_QUEUE_WAIT_SECONDS` | `180` | Longest wait for a normal lookup before the service asks the visitor to retry. |
@@ -79,7 +79,24 @@ CORS_ALLOWED_ORIGINS=https://oriolcot.github.io
 
 ## Deployment notes
 
-The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443. Season-history searches run in the background and report progress through short status requests, so they do not hold an Nginx request open while scanning.
+The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443. Season-history searches run in the background and report progress through short status requests.
+
+## Building the historic archive
+
+Run this **once on the Oracle server** after deploying the source update. It downloads every completed season for Europe, Americas, Asia-Pacific, Solo and Duos, one page at a time. It skips files already completed, so it is safe to restart after a disconnect or temporary Blizzard error.
+
+```bash
+cd ~/hsmmr
+nohup .venv/bin/python archive_leaderboards.py --delay 1.0 > archive-build.log 2>&1 &
+```
+
+The initial archive takes a while by design. Follow its progress with:
+
+```bash
+tail -f ~/hsmmr/archive-build.log
+```
+
+Do not use proxies or parallel copies of the importer. The one-second pause and sequential requests keep the initial capture gentle; afterwards completed seasons are served locally with no Blizzard request at all.
 
 ## Support
 

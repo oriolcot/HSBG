@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import concurrent.futures
+import json
 import os
 import re
 import time
@@ -35,6 +36,7 @@ app.add_middleware(
 # the redirect and returns the current season in the top-level `seasonId` field.
 BASE_URL = "https://hearthstone.blizzard.com/en-us/api/community/leaderboardsData"
 APP_DIR = Path(__file__).resolve().parent
+ARCHIVE_DIR = APP_DIR / "archives"
 SEASON_CACHE_SECONDS = 600
 RESULT_CACHE_SECONDS = 600
 CAREER_CACHE_SECONDS = int(os.getenv("CAREER_CACHE_SECONDS", "21600"))
@@ -42,12 +44,9 @@ MAX_CACHE_ENTRIES = 500
 MAX_TAGS_PER_REQUEST = 20
 MAX_PAGES_TO_SCAN = int(os.getenv("MAX_PAGES_TO_SCAN", "40"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "8"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "2"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-CAREER_RATE_LIMIT_REQUESTS = int(os.getenv("CAREER_RATE_LIMIT_REQUESTS", "1"))
-CAREER_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("CAREER_RATE_LIMIT_WINDOW_SECONDS", "600"))
 CAREER_JOB_TTL_SECONDS = int(os.getenv("CAREER_JOB_TTL_SECONDS", "3600"))
-MIN_SEASON_ID = 7
 MAX_CONCURRENT_SEARCHES = int(os.getenv("MAX_CONCURRENT_SEARCHES", "2"))
 SEARCH_QUEUE_WAIT_SECONDS = int(os.getenv("SEARCH_QUEUE_WAIT_SECONDS", "180"))
 MAX_QUEUED_CAREER_JOBS = int(os.getenv("MAX_QUEUED_CAREER_JOBS", "4"))
@@ -68,9 +67,9 @@ _season_cache = {}
 _result_cache = {}
 _career_cache = {}
 _request_times = defaultdict(list)
-_career_request_times = defaultdict(list)
 _career_scan_lock = Lock()
 _career_jobs = {}
+_archive_cache = {}
 _search_condition = Condition(Lock())
 _search_queue = deque()
 _active_searches = 0
@@ -99,6 +98,77 @@ def get_client_ip(request: Request) -> str:
     if forwarded_for:
         return forwarded_for.split(",", 1)[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def archive_path(region: str, mode: str, season_id: int) -> Path:
+    return ARCHIVE_DIR / region / mode / f"season-{season_id}.json"
+
+
+def available_archived_seasons(region: str, mode: str) -> list[int]:
+    directory = ARCHIVE_DIR / region / mode
+    if not directory.exists():
+        return []
+    seasons = []
+    for path in directory.glob("season-*.json"):
+        try:
+            seasons.append(int(path.stem.removeprefix("season-")))
+        except ValueError:
+            continue
+    return sorted(seasons, reverse=True)
+
+
+def load_archive_rows(region: str, mode: str, season_id: int):
+    path = archive_path(region, mode, season_id)
+    if not path.is_file():
+        return None
+    try:
+        modified_at = path.stat().st_mtime_ns
+        cache_key = str(path)
+        with _lock:
+            cached = _archive_cache.get(cache_key)
+            if cached and cached["modified_at"] == modified_at:
+                return cached["rows"]
+        with path.open("r", encoding="utf-8") as archive_file:
+            data = json.load(archive_file)
+        rows = data.get("rows", [])
+        if not isinstance(rows, list):
+            raise ValueError("Invalid archive rows")
+        with _lock:
+            _archive_cache[cache_key] = {"modified_at": modified_at, "rows": rows}
+        return rows
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def player_matches_tag(account_id: str, tag: str) -> bool:
+    target = tag.lower()
+    name_only = tag.split("#", 1)[0].lower()
+    account_lower = account_id.lower()
+    return account_lower == target or account_lower.startswith(name_only)
+
+
+def find_player_in_rows(tag: str, rows: list, page: int = 0):
+    for row in rows:
+        account_id = str(row.get("accountid", ""))
+        if player_matches_tag(account_id, tag):
+            return {
+                "btag": account_id,
+                "rank": row.get("rank"),
+                "rating": row.get("rating"),
+                "page": page,
+            }
+    return None
+
+
+def archived_player_results(tags: list[str], rows: list):
+    results = []
+    for tag in tags:
+        player = find_player_in_rows(tag, rows)
+        if player:
+            results.append({"found": True, **player})
+        else:
+            results.append({"btag": tag, "found": False, "error": "Not found in this archived leaderboard"})
+    return results
 
 
 def acquire_search_slot():
@@ -154,19 +224,6 @@ def client_is_rate_limited(ip: str) -> bool:
             return True
         recent.append(now)
         _request_times[ip] = recent
-        return False
-
-
-def client_is_career_rate_limited(ip: str) -> bool:
-    """Limit expensive season-history searches separately from normal lookups."""
-    now = time.monotonic()
-    with _lock:
-        recent = [t for t in _career_request_times[ip] if now - t < CAREER_RATE_LIMIT_WINDOW_SECONDS]
-        if len(recent) >= CAREER_RATE_LIMIT_REQUESTS:
-            _career_request_times[ip] = recent
-            return True
-        recent.append(now)
-        _career_request_times[ip] = recent
         return False
 
 
@@ -306,10 +363,15 @@ def seasons(mode: str = "battlegrounds", region: str = "US"):
         raise HTTPException(status_code=400, detail="Invalid region.")
 
     current_season = get_current_season(region, mode)
-    oldest_season = max(MIN_SEASON_ID, current_season - 19)
+    # Closed seasons are listed only after they have been captured locally.
+    # This avoids promising a historic lookup that would hit Blizzard live.
+    all_seasons = sorted(
+        set(available_archived_seasons(region, mode)) | {current_season},
+        reverse=True,
+    )
     return {
         "currentSeason": current_season,
-        "seasons": list(range(current_season, oldest_season - 1, -1)),
+        "seasons": all_seasons,
     }
 
 
@@ -338,8 +400,6 @@ def search_players(
         season_id = int(season)
     else:
         raise HTTPException(status_code=400, detail="Invalid season.")
-    params = {'region': region, 'leaderboardId': mode, 'seasonId': str(season_id)}
-    
     tags_introduits = [t.strip() for t in btags.replace('\n', ',').split(',') if t.strip()]
     if not tags_introduits:
         raise HTTPException(status_code=400, detail="Enter at least one BattleTag.")
@@ -353,6 +413,21 @@ def search_players(
     cached = cached_result(cache_key)
     if cached is not None:
         return cached
+
+    # Every completed season is immutable and is served from the local archive.
+    # The current season remains live, so fresh MMR and rank are never stale.
+    if season_id != current_season:
+        rows = load_archive_rows(region, mode, season_id)
+        if rows is None:
+            raise HTTPException(
+                status_code=404,
+                detail="This completed season has not been archived yet.",
+            )
+        response = archived_player_results(tags_introduits, rows)
+        store_result(cache_key, response)
+        return response
+
+    params = {'region': region, 'leaderboardId': mode, 'seasonId': str(season_id)}
     
     objectius = []
     for tag in tags_introduits:
@@ -429,8 +504,8 @@ def clean_up_career_jobs():
             del _career_jobs[job_id]
 
 
-def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
-    """Run the expensive scan outside the web request and keep lightweight progress."""
+def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan, cache_key):
+    """Search archives locally and make exactly one live request for the current season."""
     search_slot_acquired = False
     career_lock_acquired = False
     matches = []
@@ -447,14 +522,21 @@ def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
             with _lock:
                 _career_jobs[job_id]["completed_seasons"] = index - 1
                 _career_jobs[job_id]["current_season"] = season_id
-            try:
-                player = find_player_in_season(
-                    tag,
-                    {"region": region, "leaderboardId": mode, "seasonId": str(season_id)},
-                )
-            except RuntimeError:
-                unavailable_seasons.append(season_id)
-                continue
+            if season_id == current_season:
+                try:
+                    player = find_player_in_season(
+                        tag,
+                        {"region": region, "leaderboardId": mode, "seasonId": str(season_id)},
+                    )
+                except RuntimeError:
+                    unavailable_seasons.append(season_id)
+                    continue
+            else:
+                rows = load_archive_rows(region, mode, season_id)
+                if rows is None:
+                    unavailable_seasons.append(season_id)
+                    continue
+                player = find_player_in_rows(tag, rows)
             if player:
                 matches.append({"season": season_id, **player})
 
@@ -462,7 +544,7 @@ def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
             "btag": tag,
             "mode": mode,
             "region": region,
-            "currentSeason": seasons_to_scan[0],
+            "currentSeason": current_season,
             "scannedSeasons": seasons_to_scan,
             "unavailableSeasons": unavailable_seasons,
             "matches": matches,
@@ -515,18 +597,20 @@ def start_career_search(
         raise HTTPException(status_code=400, detail="Enter one valid BattleTag.")
 
     current_season = get_current_season(region, mode)
-    seasons_to_scan = list(range(current_season, max(MIN_SEASON_ID, current_season - 19) - 1, -1))
+    seasons_to_scan = sorted(
+        set(available_archived_seasons(region, mode)) | {current_season},
+        reverse=True,
+    )
     cache_key = (tag.lower(), mode, region, current_season)
     cached = cached_career_result(cache_key)
     if cached is not None:
         return {"status": "completed", "result": cached}
 
     client_ip = get_client_ip(request)
-    if client_ip not in TRUSTED_IPS and client_is_career_rate_limited(client_ip):
-        minutes = max(1, CAREER_RATE_LIMIT_WINDOW_SECONDS // 60)
+    if client_ip not in TRUSTED_IPS and client_is_rate_limited(client_ip):
         raise HTTPException(
             status_code=429,
-            detail=f"Season-history search is limited to one every {minutes} minutes. Try again shortly.",
+            detail="Too many searches. Please try again in a minute.",
         )
     clean_up_career_jobs()
     job_id = uuid4().hex
@@ -549,7 +633,7 @@ def start_career_search(
     try:
         Thread(
             target=run_career_search,
-            args=(job_id, tag, mode, region, seasons_to_scan, cache_key),
+            args=(job_id, tag, mode, region, current_season, seasons_to_scan, cache_key),
             daemon=True,
         ).start()
     except Exception as error:
