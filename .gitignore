@@ -3,3 +3,15 @@ __pycache__/
 .venv/
 .env
 archives/**/*.json
+
+# Private deployment configuration and operational data
+/deploy/
+/current_leaderboards/
+*.log
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/backups/
