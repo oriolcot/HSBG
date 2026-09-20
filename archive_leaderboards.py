@@ -78,7 +78,14 @@ def archive_season(region: str, mode: str, season: int, args: argparse.Namespace
     leaderboard = first.get("leaderboard", {})
     total_pages = int(leaderboard.get("pagination", {}).get("totalPages", 0))
     if total_pages < 1:
-        raise RuntimeError("Response did not include leaderboard pages")
+        # Blizzard does not expose leaderboard pages for every historic season.
+        # That is expected for the oldest seasons, not a reason to abandon the
+        # remaining archive run.
+        print(
+            f"skip {region} {mode} season {season}: no public leaderboard data",
+            flush=True,
+        )
+        return False
 
     rows = compact_rows(leaderboard.get("rows", []))
     print(f"archive {region} {mode} season {season}: page 1/{total_pages}", flush=True)
