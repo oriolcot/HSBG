@@ -340,9 +340,9 @@
 </div>
 
 <script>
-    // En una GitHub Page, defineix window.HSMMR_API_URL abans d'aquest script,
-    // amb la URL HTTPS del backend d'Oracle. En local continua usant el mateix origen.
-    const API_BASE_URL = window.HSMMR_API_URL || '';
+    // La GitHub Page consulta l'API HTTPS allotjada a Oracle. El valor global
+    // permet canviar-la en el futur sense haver de reescriure la lògica.
+    const API_BASE_URL = window.HSMMR_API_URL || 'https://mmrbg.duckdns.org';
 
     async function buscarLobby() {
         const rawInput = document.getElementById('btags').value.trim();
