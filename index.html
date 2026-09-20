@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HS Lobby Scanner</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f1115;
+            --glass-bg: rgba(26, 29, 36, 0.6);
+            --glass-border: rgba(255, 255, 255, 0.08);
+            --accent-start: #ff9a9e;
+            --accent-end: #fecfef;
+            --accent-glow: rgba(255, 154, 158, 0.4);
+            --text-main: #f8f9fa;
+            --text-muted: #8b949e;
+            --input-bg: rgba(9, 10, 15, 0.5);
+            --success: #2ea043;
+            --error: #f85149;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Poppins', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            /* Fons abstracte modern amb esferes difuminades */
+            background-image: 
+                radial-gradient(circle at 15% 50%, rgba(255, 154, 158, 0.08), transparent 25%),
+                radial-gradient(circle at 85% 30%, rgba(100, 149, 237, 0.08), transparent 25%);
+            background-attachment: fixed;
+        }
+
+        /* Contenidor Glassmorphism */
+        .app-container {
+            width: 100%;
+            max-width: 540px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 40px;
+            box-shadow: 0 30px 60px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 35px;
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: -1px;
+            margin-bottom: 8px;
+            /* Text amb gradient */
+            background: linear-gradient(135deg, var(--text-main) 0%, #a3b1c6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: var(--text-muted);
+            font-weight: 300;
+        }
+
+        /* Inputs moderns */
+        .input-wrapper {
+            margin-bottom: 20px;
+        }
+
+        textarea {
+            width: 100%;
+            height: 110px;
+            background: var(--input-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            padding: 16px;
+            color: var(--text-main);
+            font-size: 14px;
+            resize: none;
+            transition: all 0.3s ease;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: rgba(255, 154, 158, 0.5);
+            box-shadow: 0 0 0 4px rgba(255, 154, 158, 0.1);
+        }
+
+        textarea::placeholder {
+            color: #4b5363;
+        }
+
+        /* Controls en línia */
+        .controls-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 25px;
+        }
+
+        .select-box {
+            flex: 1;
+            position: relative;
+        }
+
+        select {
+            width: 100%;
+            appearance: none;
+            background: var(--input-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 14px 16px;
+            color: var(--text-main);
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: rgba(255, 154, 158, 0.5);
+        }
+
+        /* Icona personalitzada per al select */
+        .select-box::after {
+            content: '▾';
+            position: absolute;
+            right: 16px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            pointer-events: none;
+        }
+
+        /* Botó amb gradient animat */
+        .btn-scan {
+            width: 100%;
+            background: linear-gradient(135deg, var(--accent-start) 0%, var(--accent-end) 100%);
+            color: #0f1115;
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 10px 20px var(--accent-glow);
+        }
+
+        .btn-scan:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 25px var(--accent-glow);
+        }
+
+        .btn-scan:disabled {
+            background: #2d313a;
+            color: #6b7280;
+            box-shadow: none;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status-msg {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 13px;
+            color: var(--text-muted);
+            min-height: 20px;
+        }
+
+        /* Llista de resultats estil Targeta (substitueix la taula) */
+        .results-container {
+            margin-top: 25px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-height: 320px;
+            overflow-y: auto;
+            padding-right: 5px;
+        }
+
+        /* Scrollbar personalitzada per donar toc pro */
+        .results-container::-webkit-scrollbar {
+            width: 6px;
+        }
+        .results-container::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.1);
+            border-radius: 10px;
+        }
+        .results-container::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+        }
+
+        .player-card {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 14px 18px;
+            transition: transform 0.2s, background 0.2s;
+        }
+
+        .player-card:hover {
+            background: rgba(255, 255, 255, 0.06);
+            transform: translateX(4px);
+        }
+
+        .player-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .player-name {
+            font-weight: 600;
+            font-size: 15px;
+            color: #fff;
+        }
+
+        .player-error {
+            font-size: 12px;
+            color: var(--error);
+        }
+
+        .player-stats {
+            text-align: right;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .player-mmr {
+            font-weight: 700;
+            font-size: 16px;
+            color: var(--success);
+        }
+
+        .player-rank {
+            font-size: 12px;
+            color: var(--text-muted);
+            background: rgba(255,255,255,0.05);
+            padding: 2px 8px;
+            border-radius: 20px;
+            display: inline-block;
+        }
+
+        /* Donació discreta i elegant */
+        .monetization-footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255,255,255,0.05);
+            text-align: center;
+        }
+
+        .btn-coffee {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 13px;
+            transition: color 0.2s;
+        }
+
+        .btn-coffee:hover {
+            color: var(--text-main);
+        }
+
+        .btn-coffee svg {
+            width: 16px;
+            height: 16px;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+
+<div class="app-container">
+    <div class="header">
+        <h1>Lobby Scanner</h1>
+        <div class="subtitle">Consulta el MMR i rang públic de Battlegrounds</div>
+    </div>
+    
+    <div class="input-wrapper">
+        <textarea id="btags" placeholder="Introdueix els BattleTags...&#10;Ex: Rdu#2283, XQN" spellcheck="false"></textarea>
+    </div>
+    
+    <div class="controls-row">
+        <div class="select-box">
+            <select id="mode">
+                <option value="battlegroundsduo">Battlegrounds Duos</option>
+                <option value="battlegrounds">Battlegrounds Solo</option>
+            </select>
+        </div>
+        <div class="select-box">
+            <select id="region">
+                <option value="EU">Europa (EU)</option>
+                <option value="US">Amèrica (US)</option>
+            </select>
+        </div>
+    </div>
+
+    <button type="button" onclick="buscarLobby()" id="btn-buscar" class="btn-scan">Cercar jugadors</button>
+
+    <div class="status-msg" id="status-text"></div>
+
+    <!-- Contenidor on s'injectaran les targetes de jugadors -->
+    <div class="results-container" id="results-container" style="display: none;"></div>
+    
+    <!-- Monetització minimalista tipus "App Footer" -->
+    <div class="monetization-footer">
+        <a href="https://github.com/oriolcot/HSMMR" target="_blank" rel="noopener noreferrer" class="btn-coffee">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 8h1a4 4 0 0 1 0 8h-1"></path>
+                <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"></path>
+                <line x1="6" y1="1" x2="6" y2="4"></line>
+                <line x1="10" y1="1" x2="10" y2="4"></line>
+                <line x1="14" y1="1" x2="14" y2="4"></line>
+            </svg>
+            Veure el codi a GitHub
+        </a>
+    </div>
+</div>
+
+<script>
+    // En una GitHub Page, defineix window.HSMMR_API_URL abans d'aquest script,
+    // amb la URL HTTPS del backend d'Oracle. En local continua usant el mateix origen.
+    const API_BASE_URL = window.HSMMR_API_URL || '';
+
+    async function buscarLobby() {
+        const rawInput = document.getElementById('btags').value.trim();
+        if (!rawInput) {
+            document.getElementById('status-text').innerText = "Introdueix almenys un BattleTag.";
+            return;
+        }
+
+        const mode = document.getElementById('mode').value;
+        const region = document.getElementById('region').value;
+        const btn = document.getElementById('btn-buscar');
+        const status = document.getElementById('status-text');
+        const resultsContainer = document.getElementById('results-container');
+
+        // Estat de càrrega
+        btn.disabled = true;
+        btn.innerText = "Cercant...";
+        status.innerText = "Processant peticions a l'API...";
+        resultsContainer.style.display = 'none';
+        resultsContainer.innerHTML = '';
+
+        try {
+            const response = await fetch(`${API_BASE_URL}/buscar?btags=${encodeURIComponent(rawInput)}&mode=${mode}&region=${region}`);
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.detail || "No s'ha pogut completar la consulta.");
+            }
+            const data = await response.json();
+
+            if (data.length === 0) {
+                status.innerText = "No s'han trobat dades.";
+                btn.disabled = false;
+                btn.innerText = "Iniciar Escaneig";
+                return;
+            }
+
+            // Ordenem per classificació
+            data.sort((a, b) => {
+                if (!a.found) return 1;
+                if (!b.found) return -1;
+                return a.rank - b.rank;
+            });
+
+            // Generem les targetes (cards) per cada jugador
+            data.forEach(player => {
+                const card = document.createElement('div');
+                card.className = 'player-card';
+                
+                const info = document.createElement('div');
+                info.className = 'player-info';
+                const name = document.createElement('span');
+                name.className = 'player-name';
+                name.textContent = player.btag;
+                info.appendChild(name);
+
+                const stats = document.createElement('div');
+                stats.className = 'player-stats';
+                if (player.found) {
+                    const mmr = document.createElement('span');
+                    mmr.className = 'player-mmr';
+                    mmr.textContent = `${Number(player.rating).toLocaleString()} MMR`;
+                    const rank = document.createElement('span');
+                    rank.className = 'player-rank';
+                    rank.textContent = `Rang #${player.rank}`;
+                    stats.append(mmr, rank);
+                } else {
+                    const textMostrat = (player.error && player.error.includes("Error d'API")) ? player.error : "Fora del rànquing oficial";
+                    name.style.color = 'var(--text-muted)';
+                    const error = document.createElement('span');
+                    error.className = 'player-error';
+                    error.textContent = textMostrat;
+                    info.appendChild(error);
+                    const unavailable = document.createElement('span');
+                    unavailable.className = 'player-mmr';
+                    unavailable.style.color = '#4b5363';
+                    unavailable.textContent = '—';
+                    stats.appendChild(unavailable);
+                }
+                card.append(info, stats);
+                resultsContainer.appendChild(card);
+            });
+
+            resultsContainer.style.display = 'flex';
+            status.innerText = "";
+        } catch (error) {
+            status.innerText = error.message || "No s'ha pogut connectar amb el servei.";
+            console.error(error);
+        }
+
+        btn.disabled = false;
+        btn.innerText = "Cercar jugadors";
+    }
+</script>
+
+</body>
+</html>
