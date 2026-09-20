@@ -48,7 +48,7 @@ Server-side Nginx, Cloudflare and systemd configuration is also part of the depl
 Use **Python 3.11 or newer**.
 
 ```bash
-git clone https://github.com/oriolcot/HSMMR.git HSBG
+git clone https://github.com/oriolcot/HSBG.git HSBG
 cd HSBG
 python -m venv .venv
 ```
@@ -74,17 +74,11 @@ uvicorn backend:app --host 127.0.0.1 --port 8000 --reload
 
 Open [localhost:8000](http://127.0.0.1:8000). Historical data files are not included in a fresh clone. Review the checked-in archive builder's options with `python archive_leaderboards.py --help` before downloading data. Avoid running multiple importers concurrently.
 
-## Production architecture and security
+## Security
 
-The public website uses Cloudflare in front of Nginx. HTTP redirects to HTTPS; the origin also has a Let's Encrypt certificate. The frontend calls the API on the same origin.
+HSBG does not ask for Battle.net credentials. Search inputs are validated and player results are rendered as text. Request limits help reduce abuse.
 
-Uvicorn listens only on loopback. The web service runs as a dedicated non-administrator user with read-only access to the necessary application files and leaderboard data. A separate collector can write only the current snapshots.
-
-Additional deployed protections include validated search inputs, bounded caches and history jobs, request and resource limits, and browser security headers. Player results are rendered as text, rather than inserted as HTML.
-
-The current Content Security Policy restricts framing, embedded objects and base URLs. It is **not yet a strict script policy**: the interface still contains inline JavaScript and CSS.
-
-These controls reduce risk; they do not guarantee that the application, dependencies or hosting infrastructure are vulnerability-free. Never enter passwords, access tokens or other secrets into the player search.
+Private hosting configuration, credentials, operational logs and local data files are not part of the public source distribution. Security controls reduce risk but cannot guarantee that a service is vulnerability-free. Never enter passwords or access tokens into the player search.
 
 ## Analytics and support
 
