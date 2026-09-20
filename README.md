@@ -52,6 +52,7 @@ The production search limit is **10 searches per minute per IP**, shared between
 
 - `backend.py`: FastAPI search API and same-origin frontend serving.
 - `index.html`: responsive HSBG interface.
+- `assets/app.js`: frontend behavior, kept outside HTML for script restrictions.
 - `assets/branding/`: logo, browser icons and background textures.
 - `archive_leaderboards.py`: resumable completed-season archive builder.
 - `refresh_current.py`: current leaderboard snapshot collector.

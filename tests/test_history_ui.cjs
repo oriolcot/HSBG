@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const html = fs.readFileSync('index.html', 'utf8');
+const html = fs.readFileSync('assets/app.js', 'utf8');
 const fn = html.split('\n').find(line => line.includes('async function waitForCareerResult(jobId)'));
 (async () => {
   const partial = {matches:[{season:18}],scannedSeasons:[18],unavailableSeasons:[]};

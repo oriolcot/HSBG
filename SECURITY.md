@@ -21,8 +21,11 @@ including sensitive details. Do not perform disruptive tests on the public site.
 - Patch dependencies and the host OS, use MFA for hosting accounts, and maintain
   off-server backups with tested recovery procedures.
 
-The interface contains inline JavaScript/CSS. A strict script CSP needs additional
-work; do not assume that a default-src/script-src self policy will work unchanged.
+The application JavaScript is served from `assets/app.js`, with no inline script
+or HTML event handlers. The public deployment restricts scripts to its own origin
+and the Cloudflare Analytics script host, and blocks inline handlers and eval.
+Inline CSS remains; this is an allowlist-based CSP, not a nonce-based strict CSP.
+For your deployment, test policies against the fonts, images and analytics you use.
 Server-side protection is not installed automatically by cloning this repository.
 
 No audit or dependency scan guarantees that the application is vulnerability-free.

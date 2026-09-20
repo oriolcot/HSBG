@@ -29,7 +29,7 @@ Keep code and archives read-only to the web account. A separate collector needs 
 - Snapshot mode needs no outbound Blizzard access from the API.
 - HTTP redirects correctly and the API port is not internet-accessible.
 
-The application contains inline scripts and styles; test any CSP before enforcing it. Also allow only the specific analytics/resources you choose to retain. See [SECURITY.md](../../SECURITY.md).
+The application loads JavaScript from `assets/app.js` and still uses inline styles. Test CSP in report-only mode before enforcing it. Restrict scripts to your own origin and the specific analytics host you use, without unsafe-inline or unsafe-eval. See [SECURITY.md](../../SECURITY.md).
 
 ## Publishing these guides to GitHub Wiki
 
