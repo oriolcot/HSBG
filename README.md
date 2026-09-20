@@ -13,6 +13,7 @@ A small, open-source lookup tool for public Hearthstone Battlegrounds **MMR and 
 - Supports Battlegrounds Solo and Battlegrounds Duos.
 - Supports Europe, Americas, and Asia-Pacific.
 - Lets players check the current or an earlier leaderboard season, so ratings are read in the right context.
+- Includes an optional one-player season-history search for the selected mode and region. Results are cached and rate-limited to protect the public service.
 - Uses Blizzard's public leaderboard endpoint; it does not request a Battle.net login or store player data.
 
 ## Project layout
@@ -63,6 +64,9 @@ The service is safe to run with its defaults. These optional environment variabl
 | `MAX_WORKERS` | `8` | Maximum concurrent leaderboard requests. |
 | `RATE_LIMIT_REQUESTS` | `8` | Requests allowed per IP during the rate-limit window. |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window in seconds. |
+| `CAREER_CACHE_SECONDS` | `21600` | How long a completed season-history search is cached. |
+| `CAREER_RATE_LIMIT_REQUESTS` | `1` | Season-history searches allowed per IP during its longer rate-limit window. |
+| `CAREER_RATE_LIMIT_WINDOW_SECONDS` | `600` | Rate-limit window for the expensive season-history search. |
 
 For a GitHub Pages front end, set:
 
@@ -72,7 +76,7 @@ CORS_ALLOWED_ORIGINS=https://oriolcot.github.io
 
 ## Deployment notes
 
-The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443.
+The public instance runs behind Nginx, with Uvicorn listening only on `127.0.0.1:8000`. HTTPS is handled by Let's Encrypt. Keep the API server private and expose only the reverse proxy on ports 80 and 443. The season-history lookup can take longer than a standard request, so set `proxy_read_timeout 120s;` and `proxy_send_timeout 120s;` inside the Nginx `location` that proxies to Uvicorn.
 
 ## Support
 
