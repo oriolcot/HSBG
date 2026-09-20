@@ -46,6 +46,11 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 CAREER_RATE_LIMIT_REQUESTS = int(os.getenv("CAREER_RATE_LIMIT_REQUESTS", "1"))
 CAREER_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("CAREER_RATE_LIMIT_WINDOW_SECONDS", "600"))
 CAREER_JOB_TTL_SECONDS = int(os.getenv("CAREER_JOB_TTL_SECONDS", "3600"))
+TRUSTED_IPS = {
+    ip.strip()
+    for ip in os.getenv("TRUSTED_IPS", "").split(",")
+    if ip.strip()
+}
 BTAG_PATTERN = re.compile(r"^[A-Za-zÀ-ÿ0-9 _.'-]{2,32}(?:#[0-9]{1,8})?$")
 
 # Capçaleres estàndard per evitar qualsevol bloqueig de xarxa
@@ -75,6 +80,9 @@ def blizzard_get(params: dict, timeout: int = 10) -> dict:
 
 def get_client_ip(request: Request) -> str:
     """Use Nginx's forwarded client IP; the app only listens on loopback."""
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
     forwarded_for = request.headers.get("x-forwarded-for", "")
     if forwarded_for:
         return forwarded_for.split(",", 1)[0].strip()
@@ -263,7 +271,7 @@ def search_players(
         raise HTTPException(status_code=400, detail="Invalid region.")
 
     client_ip = get_client_ip(request)
-    if client_is_rate_limited(client_ip):
+    if client_ip not in TRUSTED_IPS and client_is_rate_limited(client_ip):
         raise HTTPException(status_code=429, detail="Too many searches. Please try again in a minute.")
 
     current_season = get_current_season(region, mode)
@@ -439,7 +447,7 @@ def start_career_search(
         return {"status": "completed", "result": cached}
 
     client_ip = get_client_ip(request)
-    if client_is_career_rate_limited(client_ip):
+    if client_ip not in TRUSTED_IPS and client_is_career_rate_limited(client_ip):
         minutes = max(1, CAREER_RATE_LIMIT_WINDOW_SECONDS // 60)
         raise HTTPException(
             status_code=429,

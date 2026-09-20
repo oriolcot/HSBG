@@ -67,6 +67,7 @@ The service is safe to run with its defaults. These optional environment variabl
 | `CAREER_CACHE_SECONDS` | `21600` | How long a completed season-history search is cached. |
 | `CAREER_RATE_LIMIT_REQUESTS` | `1` | Season-history searches allowed per IP during its longer rate-limit window. |
 | `CAREER_RATE_LIMIT_WINDOW_SECONDS` | `600` | Rate-limit window for the expensive season-history search. |
+| `TRUSTED_IPS` | Empty | Comma-separated administrator IPs exempt from this app's rate limits. Set this only in the server environment, never in the repository. |
 
 For a GitHub Pages front end, set:
 
