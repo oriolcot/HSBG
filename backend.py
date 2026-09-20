@@ -12,9 +12,9 @@ from threading import Lock
 
 app = FastAPI()
 
-# Defineix-los a Oracle, per exemple:
+# Example for Oracle:
 # CORS_ALLOWED_ORIGINS=https://oriolcot.github.io
-# El valor per defecte només permet el desenvolupament local.
+# The default allows local development only.
 allowed_origins = [
     origin.strip()
     for origin in os.getenv(
@@ -47,18 +47,18 @@ HEADERS = {
 }
 
 _lock = Lock()
-_season_cache = {"value": None, "expires_at": 0.0}
+_season_cache = {}
 _result_cache = {}
 _request_times = defaultdict(list)
 
 
 def blizzard_get(params: dict, timeout: int = 10) -> dict:
-    """Fa una petició controlada a Blizzard i valida la resposta."""
+    """Make a controlled request to Blizzard and validate the response."""
     response = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict) or "leaderboard" not in data:
-        raise ValueError("Resposta inesperada de Blizzard")
+        raise ValueError("Unexpected Blizzard response")
     return data
 
 
@@ -96,24 +96,26 @@ def store_result(key, value):
                 _result_cache.pop(next(iter(_result_cache)))
         _result_cache[key] = {"value": value, "expires_at": now + RESULT_CACHE_SECONDS}
 
-def get_latest_season() -> int:
-    """Busca i conserva temporalment l'ID de la temporada actual."""
+def get_current_season(region: str, mode: str) -> int:
+    """Fetch and cache the current season for the selected region and mode."""
     now = time.monotonic()
+    cache_key = (region, mode)
     with _lock:
-        if _season_cache["value"] is not None and _season_cache["expires_at"] > now:
-            return _season_cache["value"]
+        cached = _season_cache.get(cache_key)
+        if cached and cached["expires_at"] > now:
+            return cached["value"]
     try:
-        data = blizzard_get({'region': 'EU', 'leaderboardId': 'battlegrounds'}, timeout=5)
+        data = blizzard_get({'region': region, 'leaderboardId': mode}, timeout=5)
         season_id = int(data['leaderboard']['seasonId'])
     except (requests.RequestException, ValueError, KeyError, TypeError):
-        raise HTTPException(status_code=503, detail="No es pot consultar Blizzard ara mateix.")
+        raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.")
 
     with _lock:
-        _season_cache.update(value=season_id, expires_at=now + SEASON_CACHE_SECONDS)
+        _season_cache[cache_key] = {"value": season_id, "expires_at": now + SEASON_CACHE_SECONDS}
     return season_id
 
 def fetch_page(page: int, params: dict):
-    """Descarrega una sola pàgina; els errors no interrompen tota la cerca."""
+    """Fetch one page without failing the full lookup on a network error."""
     p = params.copy()
     p['page'] = str(page)
     try:
@@ -123,70 +125,92 @@ def fetch_page(page: int, params: dict):
         return page, []
 
 @app.get("/", response_class=HTMLResponse)
-def llegir_index():
+def serve_index():
     try:
         with (APP_DIR / "index.html").open("r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "<h1>Error: No s'ha trobat el fitxer 'index.html' a la mateixa carpeta!</h1>"
+        return "<h1>Unable to find index.html next to the application.</h1>"
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.get("/buscar")
-def buscar_jugadors(request: Request, btags: str, mode: str = "battlegroundsduo", region: str = "EU"):
+@app.get("/seasons")
+def seasons(mode: str = "battlegroundsduo", region: str = "EU"):
     if mode not in {"battlegrounds", "battlegroundsduo"}:
-        raise HTTPException(status_code=400, detail="Mode no vàlid.")
+        raise HTTPException(status_code=400, detail="Invalid game mode.")
     if region not in {"EU", "US", "AP"}:
-        raise HTTPException(status_code=400, detail="Regió no vàlida.")
+        raise HTTPException(status_code=400, detail="Invalid region.")
+
+    current_season = get_current_season(region, mode)
+    oldest_season = max(1, current_season - 19)
+    return {
+        "currentSeason": current_season,
+        "seasons": list(range(current_season, oldest_season - 1, -1)),
+    }
+
+
+@app.get("/buscar")
+def search_players(
+    request: Request,
+    btags: str,
+    mode: str = "battlegroundsduo",
+    region: str = "EU",
+    season: str = "current",
+):
+    if mode not in {"battlegrounds", "battlegroundsduo"}:
+        raise HTTPException(status_code=400, detail="Invalid game mode.")
+    if region not in {"EU", "US", "AP"}:
+        raise HTTPException(status_code=400, detail="Invalid region.")
 
     client_ip = request.client.host if request.client else "unknown"
     if client_is_rate_limited(client_ip):
-        raise HTTPException(status_code=429, detail="Massa consultes. Torna-ho a provar d'aquí a un minut.")
+        raise HTTPException(status_code=429, detail="Too many searches. Please try again in a minute.")
 
-    season_id = get_latest_season()
+    current_season = get_current_season(region, mode)
+    if season == "current":
+        season_id = current_season
+    elif season.isdigit() and 1 <= int(season) <= current_season:
+        season_id = int(season)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid season.")
     params = {'region': region, 'leaderboardId': mode, 'seasonId': str(season_id)}
     
-    # Netegem i processem els noms que l'usuari ha introduït
     tags_introduits = [t.strip() for t in btags.replace('\n', ',').split(',') if t.strip()]
     if not tags_introduits:
-        raise HTTPException(status_code=400, detail="Introdueix almenys un BattleTag.")
+        raise HTTPException(status_code=400, detail="Enter at least one BattleTag.")
     if len(tags_introduits) > MAX_TAGS_PER_REQUEST:
-        raise HTTPException(status_code=400, detail=f"Màxim de {MAX_TAGS_PER_REQUEST} BattleTags per consulta.")
+        raise HTTPException(status_code=400, detail=f"A maximum of {MAX_TAGS_PER_REQUEST} BattleTags is allowed per search.")
     invalid_tags = [tag for tag in tags_introduits if not BTAG_PATTERN.fullmatch(tag)]
     if invalid_tags:
-        raise HTTPException(status_code=400, detail="Un o més BattleTags no tenen un format vàlid.")
+        raise HTTPException(status_code=400, detail="One or more BattleTags have an invalid format.")
 
     cache_key = (tuple(sorted(tag.lower() for tag in tags_introduits)), mode, region, season_id)
     cached = cached_result(cache_key)
     if cached is not None:
         return cached
     
-    # Creem l'estructura de cerca per controlar què ens falta trobar
     objectius = []
     for tag in tags_introduits:
         objectius.append({
             "original": tag,
             "lower": tag.lower(),
-            "nom_sense_tag": tag.split('#')[0].lower()
+            "name_only": tag.split('#')[0].lower()
         })
         
-    # Inicialitzem tots els resultats com a "no trobats" per defecte
-    resultats = {obj["original"]: {"btag": obj["original"], "found": False, "error": "No trobat (fora del top)"} for obj in objectius}
+    resultats = {obj["original"]: {"btag": obj["original"], "found": False, "error": "Not found (outside the scanned leaderboard)"} for obj in objectius}
     objectius_pendents = objectius.copy()
 
-    # 1. Obtenim la primera pàgina per saber el total de pàgines i mirar el Top 25
     try:
         data = blizzard_get({**params, 'page': '1'})
         total_pages = data.get('leaderboard', {}).get('pagination', {}).get('totalPages', 0)
         rows_p1 = data.get('leaderboard', {}).get('rows', [])
     except (requests.RequestException, ValueError, KeyError, TypeError):
-        raise HTTPException(status_code=503, detail="No es pot consultar Blizzard ara mateix.")
+        raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.")
 
-    # Funció auxiliar per comprovar si els jugadors cercats estan a les files d'una pàgina
-    def comprovar_jugadors_a_la_pagina(rows, num_pag):
+    def check_players_on_page(rows, num_pag):
         nonlocal objectius_pendents
         trobat_algun = False
         for row in rows:
@@ -194,10 +218,9 @@ def buscar_jugadors(request: Request, btags: str, mode: str = "battlegroundsduo"
             acc_id_lower = acc_id.lower()
             
             for obj in list(objectius_pendents):
-                # Coincidència exacta o que comenci pel mateix nom d'usuari
-                if acc_id_lower == obj["lower"] or acc_id_lower.startswith(obj["nom_sense_tag"]):
+                if acc_id_lower == obj["lower"] or acc_id_lower.startswith(obj["name_only"]):
                     resultats[obj["original"]] = {
-                        "btag": acc_id,  # Retornem el BattleTag oficial amb les majúscules correctes de Blizzard
+                        "btag": acc_id,
                         "rank": row.get('rank'),
                         "rating": row.get('rating'),
                         "found": True,
@@ -207,16 +230,13 @@ def buscar_jugadors(request: Request, btags: str, mode: str = "battlegroundsduo"
                     trobat_algun = True
         return trobat_algun
 
-    # Mirem si algun dels objectius és a la Pàgina 1
-    comprovar_jugadors_a_la_pagina(rows_p1, 1)
+    check_players_on_page(rows_p1, 1)
 
-    # Si ja els hem trobat tots a la pàgina 1, o no hi ha més pàgines, ja podem acabar
     if not objectius_pendents or total_pages <= 1:
         response = list(resultats.values())
         store_result(cache_key, response)
         return response
 
-    # 2. Cerca en lots: limita la càrrega al servidor i a l'API de Blizzard.
     total_a_escanejar = min(total_pages, MAX_PAGES_TO_SCAN)
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -226,7 +246,7 @@ def buscar_jugadors(request: Request, btags: str, mode: str = "battlegroundsduo"
             for future in concurrent.futures.as_completed(futures):
                 num_pag, files_pag = future.result()
                 if files_pag:
-                    comprovar_jugadors_a_la_pagina(files_pag, num_pag)
+                    check_players_on_page(files_pag, num_pag)
             if not objectius_pendents:
                 break
                         

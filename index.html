@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ca">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -35,14 +35,12 @@
             justify-content: center;
             align-items: center;
             padding: 20px;
-            /* Fons abstracte modern amb esferes difuminades */
             background-image: 
                 radial-gradient(circle at 15% 50%, rgba(255, 154, 158, 0.08), transparent 25%),
                 radial-gradient(circle at 85% 30%, rgba(100, 149, 237, 0.08), transparent 25%);
             background-attachment: fixed;
         }
 
-        /* Contenidor Glassmorphism */
         .app-container {
             width: 100%;
             max-width: 540px;
@@ -65,7 +63,6 @@
             font-weight: 700;
             letter-spacing: -1px;
             margin-bottom: 8px;
-            /* Text amb gradient */
             background: linear-gradient(135deg, var(--text-main) 0%, #a3b1c6 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
@@ -77,7 +74,6 @@
             font-weight: 300;
         }
 
-        /* Inputs moderns */
         .input-wrapper {
             margin-bottom: 20px;
         }
@@ -105,7 +101,6 @@
             color: #4b5363;
         }
 
-        /* Controls en línia */
         .controls-row {
             display: flex;
             gap: 12px;
@@ -135,7 +130,6 @@
             border-color: rgba(255, 154, 158, 0.5);
         }
 
-        /* Icona personalitzada per al select */
         .select-box::after {
             content: '▾';
             position: absolute;
@@ -146,7 +140,6 @@
             pointer-events: none;
         }
 
-        /* Botó amb gradient animat */
         .btn-scan {
             width: 100%;
             background: linear-gradient(135deg, var(--accent-start) 0%, var(--accent-end) 100%);
@@ -182,7 +175,6 @@
             min-height: 20px;
         }
 
-        /* Llista de resultats estil Targeta (substitueix la taula) */
         .results-container {
             margin-top: 25px;
             display: flex;
@@ -193,7 +185,6 @@
             padding-right: 5px;
         }
 
-        /* Scrollbar personalitzada per donar toc pro */
         .results-container::-webkit-scrollbar {
             width: 6px;
         }
@@ -261,7 +252,6 @@
             display: inline-block;
         }
 
-        /* Donació discreta i elegant */
         .monetization-footer {
             margin-top: 30px;
             padding-top: 20px;
@@ -294,12 +284,12 @@
 
 <div class="app-container">
     <div class="header">
-        <h1>Lobby Scanner</h1>
-        <div class="subtitle">Consulta el MMR i rang públic de Battlegrounds</div>
+        <h1>BG Lobby Scanner</h1>
+        <div class="subtitle">Look up public Battlegrounds MMR and leaderboard rank</div>
     </div>
     
     <div class="input-wrapper">
-        <textarea id="btags" placeholder="Introdueix els BattleTags...&#10;Ex: Rdu#2283, XQN" spellcheck="false"></textarea>
+        <textarea id="btags" placeholder="Enter BattleTags...&#10;Example: Rdu#2283, XQN" spellcheck="false" aria-label="BattleTags"></textarea>
     </div>
     
     <div class="controls-row">
@@ -311,13 +301,19 @@
         </div>
         <div class="select-box">
             <select id="region">
-                <option value="EU">Europa (EU)</option>
-                <option value="US">Amèrica (US)</option>
+                <option value="EU">Europe (EU)</option>
+                <option value="US">Americas (US)</option>
+                <option value="AP">Asia-Pacific (AP)</option>
+            </select>
+        </div>
+        <div class="select-box">
+            <select id="season" aria-label="Season">
+                <option value="current">Current Season</option>
             </select>
         </div>
     </div>
 
-    <button type="button" onclick="buscarLobby()" id="btn-buscar" class="btn-scan">Cercar jugadors</button>
+    <button type="button" onclick="searchLobby()" id="btn-search" class="btn-scan">Search Players</button>
 
     <div class="status-msg" id="status-text"></div>
 
@@ -334,59 +330,85 @@
                 <line x1="10" y1="1" x2="10" y2="4"></line>
                 <line x1="14" y1="1" x2="14" y2="4"></line>
             </svg>
-            Veure el codi a GitHub
+            View the source code on GitHub
         </a>
     </div>
 </div>
 
 <script>
-    // La GitHub Page consulta l'API HTTPS allotjada a Oracle. El valor global
-    // permet canviar-la en el futur sense haver de reescriure la lògica.
     const API_BASE_URL = window.HSMMR_API_URL || 'https://mmrbg.duckdns.org';
 
-    async function buscarLobby() {
+    const modeSelect = document.getElementById('mode');
+    const regionSelect = document.getElementById('region');
+    const seasonSelect = document.getElementById('season');
+
+    async function loadSeasons() {
+        const currentValue = seasonSelect.value;
+        seasonSelect.disabled = true;
+        seasonSelect.innerHTML = '<option value="current">Loading seasons…</option>';
+
+        try {
+            const response = await fetch(`${API_BASE_URL}/seasons?mode=${modeSelect.value}&region=${regionSelect.value}`);
+            if (!response.ok) throw new Error('Unable to load seasons.');
+            const { currentSeason, seasons } = await response.json();
+            seasonSelect.replaceChildren();
+
+            const currentOption = new Option(`Current Season (Season ${currentSeason})`, 'current');
+            seasonSelect.add(currentOption);
+            seasons.filter(season => season !== currentSeason).forEach(season => {
+                seasonSelect.add(new Option(`Season ${season}`, String(season)));
+            });
+            seasonSelect.value = [...seasonSelect.options].some(option => option.value === currentValue)
+                ? currentValue
+                : 'current';
+        } catch {
+            seasonSelect.replaceChildren(new Option('Current Season', 'current'));
+        } finally {
+            seasonSelect.disabled = false;
+        }
+    }
+
+    async function searchLobby() {
         const rawInput = document.getElementById('btags').value.trim();
         if (!rawInput) {
-            document.getElementById('status-text').innerText = "Introdueix almenys un BattleTag.";
+            document.getElementById('status-text').innerText = "Enter at least one BattleTag.";
             return;
         }
 
-        const mode = document.getElementById('mode').value;
-        const region = document.getElementById('region').value;
-        const btn = document.getElementById('btn-buscar');
+        const mode = modeSelect.value;
+        const region = regionSelect.value;
+        const season = seasonSelect.value;
+        const btn = document.getElementById('btn-search');
         const status = document.getElementById('status-text');
         const resultsContainer = document.getElementById('results-container');
 
-        // Estat de càrrega
         btn.disabled = true;
-        btn.innerText = "Cercant...";
-        status.innerText = "Processant peticions a l'API...";
+        btn.innerText = "Searching...";
+        status.innerText = "Checking Blizzard's leaderboard...";
         resultsContainer.style.display = 'none';
         resultsContainer.innerHTML = '';
 
         try {
-            const response = await fetch(`${API_BASE_URL}/buscar?btags=${encodeURIComponent(rawInput)}&mode=${mode}&region=${region}`);
+            const response = await fetch(`${API_BASE_URL}/buscar?btags=${encodeURIComponent(rawInput)}&mode=${mode}&region=${region}&season=${season}`);
             if (!response.ok) {
                 const error = await response.json().catch(() => ({}));
-                throw new Error(error.detail || "No s'ha pogut completar la consulta.");
+                throw new Error(error.detail || "The search could not be completed.");
             }
             const data = await response.json();
 
             if (data.length === 0) {
-                status.innerText = "No s'han trobat dades.";
+                status.innerText = "No results found.";
                 btn.disabled = false;
-                btn.innerText = "Iniciar Escaneig";
+                btn.innerText = "Search Players";
                 return;
             }
 
-            // Ordenem per classificació
             data.sort((a, b) => {
                 if (!a.found) return 1;
                 if (!b.found) return -1;
                 return a.rank - b.rank;
             });
 
-            // Generem les targetes (cards) per cada jugador
             data.forEach(player => {
                 const card = document.createElement('div');
                 card.className = 'player-card';
@@ -406,14 +428,14 @@
                     mmr.textContent = `${Number(player.rating).toLocaleString()} MMR`;
                     const rank = document.createElement('span');
                     rank.className = 'player-rank';
-                    rank.textContent = `Rang #${player.rank}`;
+                    rank.textContent = `Rank #${player.rank}`;
                     stats.append(mmr, rank);
                 } else {
-                    const textMostrat = (player.error && player.error.includes("Error d'API")) ? player.error : "Fora del rànquing oficial";
+                    const displayText = player.error || "Outside the scanned leaderboard";
                     name.style.color = 'var(--text-muted)';
                     const error = document.createElement('span');
                     error.className = 'player-error';
-                    error.textContent = textMostrat;
+                    error.textContent = displayText;
                     info.appendChild(error);
                     const unavailable = document.createElement('span');
                     unavailable.className = 'player-mmr';
@@ -428,13 +450,17 @@
             resultsContainer.style.display = 'flex';
             status.innerText = "";
         } catch (error) {
-            status.innerText = error.message || "No s'ha pogut connectar amb el servei.";
+            status.innerText = error.message || "Unable to connect to the service.";
             console.error(error);
         }
 
         btn.disabled = false;
-        btn.innerText = "Cercar jugadors";
+        btn.innerText = "Search Players";
     }
+
+    modeSelect.addEventListener('change', loadSeasons);
+    regionSelect.addEventListener('change', loadSeasons);
+    loadSeasons();
 </script>
 
 </body>
