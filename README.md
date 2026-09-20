@@ -12,8 +12,8 @@ A small, open-source lookup tool for public Hearthstone Battlegrounds **MMR and 
 - Shows both a player's MMR and their position on the selected regional leaderboard.
 - Supports Battlegrounds Solo and Battlegrounds Duos.
 - Supports Europe, Americas, and Asia-Pacific.
-- Lets players check the current or an earlier leaderboard season, so ratings are read in the right context.
-- Includes an optional one-player season-history search for the selected mode and region. Results are cached and rate-limited to protect the public service.
+- Lets players check Seasons 7 through the current leaderboard season, so ratings are read in the right context.
+- Includes an optional one-player season-history search for the selected mode and region. Results are cached, rate-limited, and queued to protect the public service.
 - Uses Blizzard's public leaderboard endpoint; it does not request a Battle.net login or store player data.
 
 ## Project layout
@@ -68,6 +68,8 @@ The service is safe to run with its defaults. These optional environment variabl
 | `CAREER_RATE_LIMIT_REQUESTS` | `1` | Season-history searches allowed per IP during its longer rate-limit window. |
 | `CAREER_RATE_LIMIT_WINDOW_SECONDS` | `600` | Rate-limit window for the expensive season-history search. |
 | `TRUSTED_IPS` | Empty | Comma-separated administrator IPs exempt from this app's rate limits. Set this only in the server environment, never in the repository. |
+| `MAX_CONCURRENT_SEARCHES` | `2` | Total Blizzard-bound searches allowed at once across every visitor. |
+| `SEARCH_QUEUE_WAIT_SECONDS` | `180` | Longest wait for a normal lookup before the service asks the visitor to retry. |
 
 For a GitHub Pages front end, set:
 

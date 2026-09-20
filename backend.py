@@ -6,9 +6,10 @@ import concurrent.futures
 import os
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from functools import wraps
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Condition, Lock, Thread
 from uuid import uuid4
 
 app = FastAPI()
@@ -46,6 +47,10 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 CAREER_RATE_LIMIT_REQUESTS = int(os.getenv("CAREER_RATE_LIMIT_REQUESTS", "1"))
 CAREER_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("CAREER_RATE_LIMIT_WINDOW_SECONDS", "600"))
 CAREER_JOB_TTL_SECONDS = int(os.getenv("CAREER_JOB_TTL_SECONDS", "3600"))
+MIN_SEASON_ID = 7
+MAX_CONCURRENT_SEARCHES = int(os.getenv("MAX_CONCURRENT_SEARCHES", "2"))
+SEARCH_QUEUE_WAIT_SECONDS = int(os.getenv("SEARCH_QUEUE_WAIT_SECONDS", "180"))
+MAX_QUEUED_CAREER_JOBS = int(os.getenv("MAX_QUEUED_CAREER_JOBS", "4"))
 TRUSTED_IPS = {
     ip.strip()
     for ip in os.getenv("TRUSTED_IPS", "").split(",")
@@ -66,6 +71,13 @@ _request_times = defaultdict(list)
 _career_request_times = defaultdict(list)
 _career_scan_lock = Lock()
 _career_jobs = {}
+_search_condition = Condition(Lock())
+_search_queue = deque()
+_active_searches = 0
+
+
+class SearchQueueTimeout(Exception):
+    """Raised when a search has waited too long for a shared upstream slot."""
 
 
 def blizzard_get(params: dict, timeout: int = 10) -> dict:
@@ -87,6 +99,50 @@ def get_client_ip(request: Request) -> str:
     if forwarded_for:
         return forwarded_for.split(",", 1)[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def acquire_search_slot():
+    """Wait in FIFO order until one of the shared Blizzard search slots is free."""
+    global _active_searches
+    token = object()
+    deadline = time.monotonic() + SEARCH_QUEUE_WAIT_SECONDS
+    with _search_condition:
+        _search_queue.append(token)
+        while _search_queue[0] is not token or _active_searches >= MAX_CONCURRENT_SEARCHES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _search_queue.remove(token)
+                _search_condition.notify_all()
+                raise SearchQueueTimeout()
+            _search_condition.wait(remaining)
+        _search_queue.popleft()
+        _active_searches += 1
+
+
+def release_search_slot():
+    """Always wake the next queued search after a completed or failed lookup."""
+    global _active_searches
+    with _search_condition:
+        _active_searches = max(0, _active_searches - 1)
+        _search_condition.notify_all()
+
+
+def queued_search(function):
+    """Apply the shared FIFO limit to a normal lobby lookup."""
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            acquire_search_slot()
+        except SearchQueueTimeout as error:
+            raise HTTPException(
+                status_code=503,
+                detail="The search queue is busy. Please try again in a moment.",
+            ) from error
+        try:
+            return function(*args, **kwargs)
+        finally:
+            release_search_slot()
+    return wrapper
 
 
 def client_is_rate_limited(ip: str) -> bool:
@@ -250,7 +306,7 @@ def seasons(mode: str = "battlegrounds", region: str = "US"):
         raise HTTPException(status_code=400, detail="Invalid region.")
 
     current_season = get_current_season(region, mode)
-    oldest_season = max(1, current_season - 19)
+    oldest_season = max(MIN_SEASON_ID, current_season - 19)
     return {
         "currentSeason": current_season,
         "seasons": list(range(current_season, oldest_season - 1, -1)),
@@ -258,6 +314,7 @@ def seasons(mode: str = "battlegrounds", region: str = "US"):
 
 
 @app.get("/buscar")
+@queued_search
 def search_players(
     request: Request,
     btags: str,
@@ -374,10 +431,18 @@ def clean_up_career_jobs():
 
 def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
     """Run the expensive scan outside the web request and keep lightweight progress."""
-    started_at = time.monotonic()
+    search_slot_acquired = False
+    career_lock_acquired = False
     matches = []
     unavailable_seasons = []
     try:
+        _career_scan_lock.acquire()
+        career_lock_acquired = True
+        acquire_search_slot()
+        search_slot_acquired = True
+        started_at = time.monotonic()
+        with _lock:
+            _career_jobs[job_id]["status"] = "running"
         for index, season_id in enumerate(seasons_to_scan, start=1):
             with _lock:
                 _career_jobs[job_id]["completed_seasons"] = index - 1
@@ -411,6 +476,13 @@ def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
                 result=result,
                 finished_at=time.monotonic(),
             )
+    except SearchQueueTimeout:
+        with _lock:
+            _career_jobs[job_id].update(
+                status="failed",
+                detail="The search queue is busy. Please try again later.",
+                finished_at=time.monotonic(),
+            )
     except Exception:
         with _lock:
             _career_jobs[job_id].update(
@@ -419,7 +491,10 @@ def run_career_search(job_id, tag, mode, region, seasons_to_scan, cache_key):
                 finished_at=time.monotonic(),
             )
     finally:
-        _career_scan_lock.release()
+        if search_slot_acquired:
+            release_search_slot()
+        if career_lock_acquired:
+            _career_scan_lock.release()
 
 
 @app.get("/career")
@@ -440,7 +515,7 @@ def start_career_search(
         raise HTTPException(status_code=400, detail="Enter one valid BattleTag.")
 
     current_season = get_current_season(region, mode)
-    seasons_to_scan = list(range(current_season, max(1, current_season - 19) - 1, -1))
+    seasons_to_scan = list(range(current_season, max(MIN_SEASON_ID, current_season - 19) - 1, -1))
     cache_key = (tag.lower(), mode, region, current_season)
     cached = cached_career_result(cache_key)
     if cached is not None:
@@ -453,17 +528,20 @@ def start_career_search(
             status_code=429,
             detail=f"Season-history search is limited to one every {minutes} minutes. Try again shortly.",
         )
-    if not _career_scan_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=429,
-            detail="A season-history search is already running. Please try again shortly.",
-        )
-
     clean_up_career_jobs()
     job_id = uuid4().hex
     with _lock:
+        queued_jobs = sum(
+            job["status"] in {"queued", "running"}
+            for job in _career_jobs.values()
+        )
+        if queued_jobs >= MAX_QUEUED_CAREER_JOBS:
+            raise HTTPException(
+                status_code=503,
+                detail="The season-history queue is full. Please try again later.",
+            )
         _career_jobs[job_id] = {
-            "status": "running",
+            "status": "queued",
             "completed_seasons": 0,
             "current_season": current_season,
             "total_seasons": len(seasons_to_scan),
@@ -475,7 +553,6 @@ def start_career_search(
             daemon=True,
         ).start()
     except Exception as error:
-        _career_scan_lock.release()
         with _lock:
             del _career_jobs[job_id]
         raise HTTPException(status_code=503, detail="Unable to start the season-history search.") from error
@@ -483,7 +560,7 @@ def start_career_search(
     return JSONResponse(
         status_code=202,
         content={
-            "status": "running",
+            "status": "queued",
             "jobId": job_id,
             "completedSeasons": 0,
             "currentSeason": current_season,
@@ -503,7 +580,7 @@ def career_search_status(job_id: str):
         if job["status"] == "failed":
             return {"status": "failed", "detail": job["detail"]}
         return {
-            "status": "running",
+            "status": job["status"],
             "completedSeasons": job["completed_seasons"],
             "currentSeason": job["current_season"],
             "totalSeasons": job["total_seasons"],
