@@ -29,7 +29,9 @@ app.add_middleware(
     allow_headers=[],
 )
 
-BASE_URL = "https://hearthstone.blizzard.com/api/community/leaderboardsData"
+# Blizzard redirects the unlocalized endpoint. Going straight to en-us avoids
+# the redirect and returns the current season in the top-level `seasonId` field.
+BASE_URL = "https://hearthstone.blizzard.com/en-us/api/community/leaderboardsData"
 APP_DIR = Path(__file__).resolve().parent
 SEASON_CACHE_SECONDS = 600
 RESULT_CACHE_SECONDS = 600
@@ -106,7 +108,7 @@ def get_current_season(region: str, mode: str) -> int:
             return cached["value"]
     try:
         data = blizzard_get({'region': region, 'leaderboardId': mode}, timeout=5)
-        season_id = int(data['leaderboard']['seasonId'])
+        season_id = int(data['seasonId'])
     except (requests.RequestException, ValueError, KeyError, TypeError):
         raise HTTPException(status_code=503, detail="Blizzard is unavailable right now. Please try again shortly.")
 
