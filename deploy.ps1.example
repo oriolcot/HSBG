@@ -1,0 +1,107 @@
+# Example deployment script for HSBG
+# Copy this file to 'deploy.ps1' and configure your target environment in a local '.deploy.env' file.
+# 'deploy.ps1' and '.deploy.env' are ignored by Git to protect your private server details.
+
+$ErrorActionPreference = "Stop"
+
+# Configuration (defaults can be overridden in a local .deploy.env file or environment variables)
+if (Test-Path "$PSScriptRoot\.deploy.env") {
+    Get-Content "$PSScriptRoot\.deploy.env" | ForEach-Object {
+        if ($_ -match '^\s*([^#=]+)\s*=\s*(.*)$') {
+            [System.Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim())
+        }
+    }
+}
+
+$SSH_TARGET = if ($env:HSBG_SSH_TARGET) { $env:HSBG_SSH_TARGET } else { "user@your-server-host" }
+$REMOTE_PATH = if ($env:HSBG_REMOTE_PATH) { $env:HSBG_REMOTE_PATH } else { "/var/www/hsbg" }
+$SERVICE_NAME = if ($env:HSBG_SERVICE_NAME) { $env:HSBG_SERVICE_NAME } else { "hsbg" }
+$SSH_TIMEOUT = 10
+
+function Invoke-RemoteRollback($target, $path, $service, $commit) {
+    Write-Host "Initiating rollback to commit $commit on server..." -ForegroundColor Yellow
+    $rollbackCmd = "git -C $path reset --hard $commit && sudo systemctl restart $service"
+    ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT $target $rollbackCmd
+    
+    # Verify rollback health
+    Start-Sleep -Seconds 3
+    $healthCheck = ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT $target "curl -s http://127.0.0.1:8000/health"
+    if ($healthCheck -match '"status"\s*:\s*"ok"') {
+        Write-Host "⚠️ Service was successfully restored to previous commit ($commit)." -ForegroundColor Yellow
+    } else {
+        Write-Host "❌ CRITICAL: Rollback failed to restore healthy service state!" -ForegroundColor Red
+    }
+}
+
+Write-Host "=== 1/4 Running local tests... ===" -ForegroundColor Cyan
+python -m unittest discover -s tests
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Tests failed. Aborting deployment." -ForegroundColor Red
+    exit 1
+}
+Write-Host "✅ All tests passed." -ForegroundColor Green
+
+Write-Host "`n=== 2/4 Checking git changes... ===" -ForegroundColor Cyan
+# Stage only tracked modifications to avoid exposing untracked private files
+git add -u
+$status = git status --porcelain
+if ($status) {
+    Write-Host "Uncommitted changes found in tracked files. Committing..." -ForegroundColor Yellow
+    git commit -m "Auto-deploy: update service"
+}
+Write-Host "Pushing changes to GitHub..." -ForegroundColor Cyan
+git push origin main
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Failed to push to GitHub!" -ForegroundColor Red
+    exit 1
+}
+Write-Host "✅ Code pushed to GitHub." -ForegroundColor Green
+
+Write-Host "`n=== 3/4 Deploying to remote server ($SSH_TARGET)... ===" -ForegroundColor Cyan
+# Capture the exact pre-deployment commit hash on the remote host for reliable rollback
+$initialCommit = (ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT $SSH_TARGET "git -C $REMOTE_PATH rev-parse HEAD").Trim()
+if (-not $initialCommit -or $LASTEXITCODE -ne 0) {
+    Write-Host "❌ Unable to determine remote initial commit. Aborting deployment." -ForegroundColor Red
+    exit 1
+}
+Write-Host "Current remote commit: $initialCommit" -ForegroundColor DarkGray
+
+$remoteDeployCmd = "git -C $REMOTE_PATH pull origin main && sudo systemctl restart $SERVICE_NAME"
+ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT $SSH_TARGET $remoteDeployCmd
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Remote update or service restart failed!" -ForegroundColor Red
+    Invoke-RemoteRollback -target $SSH_TARGET -path $REMOTE_PATH -service $SERVICE_NAME -commit $initialCommit
+    exit 1
+}
+
+Write-Host "`n=== 4/4 Verifying health endpoint... ===" -ForegroundColor Cyan
+$maxAttempts = 6
+$attempt = 1
+$success = $false
+$statusCode = "000"
+$responseBody = ""
+
+while ($attempt -le $maxAttempts) {
+    Start-Sleep -Seconds 2
+    $healthCmd = "curl -s -w '\n%{http_code}' http://127.0.0.1:8000/health"
+    $healthOutput = ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT $SSH_TARGET $healthCmd
+    $lines = $healthOutput.Trim().Split("`n")
+    $statusCode = $lines[-1].Trim()
+    $responseBody = if ($lines.Count -gt 1) { $lines[0..($lines.Count - 2)] -join "`n" } else { "" }
+
+    if ($statusCode -eq "200" -and $responseBody -match '"status"\s*:\s*"ok"') {
+        $success = $true
+        break
+    }
+    Write-Host "Attempt $attempt/${maxAttempts}: waiting for service startup (HTTP ${statusCode})..." -ForegroundColor Yellow
+    $attempt++
+}
+
+if (-not $success) {
+    Write-Host "❌ Health check failed after $maxAttempts attempts! (HTTP ${statusCode}: ${responseBody})" -ForegroundColor Red
+    Invoke-RemoteRollback -target $SSH_TARGET -path $REMOTE_PATH -service $SERVICE_NAME -commit $initialCommit
+    exit 1
+}
+
+Write-Host "✅ Health check verified (HTTP $statusCode: $responseBody)" -ForegroundColor Green
+Write-Host "`n🎉 Deployment succeeded!" -ForegroundColor Green

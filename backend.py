@@ -47,6 +47,7 @@ if DATA_MODE not in {"snapshot", "live"}:
 SEASON_CACHE_SECONDS = 600
 RESULT_CACHE_SECONDS = 600
 CAREER_CACHE_SECONDS = int(os.getenv("CAREER_CACHE_SECONDS", "21600"))
+MAX_CACHED_ARCHIVE_SEASONS = int(os.getenv("MAX_CACHED_ARCHIVE_SEASONS", "6"))
 MAX_CACHE_ENTRIES = 500
 MAX_RATE_LIMIT_CLIENTS = 10000
 MAX_RETAINED_CAREER_JOBS = 500
@@ -141,6 +142,7 @@ def load_archive_rows(region: str, mode: str, season_id: int):
         with _lock:
             cached = _archive_cache.get(cache_key)
             if cached and cached["modified_at"] == modified_at:
+                _archive_cache[cache_key] = _archive_cache.pop(cache_key)
                 return cached["rows"]
         with path.open("r", encoding="utf-8") as archive_file:
             data = json.load(archive_file)
@@ -148,6 +150,9 @@ def load_archive_rows(region: str, mode: str, season_id: int):
         if not isinstance(rows, list):
             raise ValueError("Invalid archive rows")
         with _lock:
+            if len(_archive_cache) >= MAX_CACHED_ARCHIVE_SEASONS and cache_key not in _archive_cache:
+                oldest = next(iter(_archive_cache))
+                del _archive_cache[oldest]
             _archive_cache[cache_key] = {"modified_at": modified_at, "rows": rows}
         return rows
     except (OSError, ValueError, json.JSONDecodeError):
@@ -156,30 +161,40 @@ def load_archive_rows(region: str, mode: str, season_id: int):
 
 def player_matches_tag(account_id: str, tag: str) -> bool:
     target = tag.lower()
-    name_only = tag.split("#", 1)[0].lower()
     account_lower = account_id.lower()
-    return account_lower == target or account_lower.startswith(name_only)
+    if "#" in tag:
+        return account_lower == target
+    name_only = target
+    account_name = account_lower.split("#", 1)[0]
+    return account_name == name_only
 
 
-def find_player_in_rows(tag: str, rows: list, page: int = 0):
+def find_players_in_rows(tag: str, rows: list, page: int = 0) -> list[dict]:
+    matches = []
     for row in rows:
         account_id = str(row.get("accountid", ""))
         if player_matches_tag(account_id, tag):
-            return {
+            matches.append({
                 "btag": account_id,
                 "rank": row.get("rank"),
                 "rating": row.get("rating"),
                 "page": page,
-            }
-    return None
+            })
+    return matches
+
+
+def find_player_in_rows(tag: str, rows: list, page: int = 0):
+    players = find_players_in_rows(tag, rows, page)
+    return players[0] if players else None
 
 
 def archived_player_results(tags: list[str], rows: list):
     results = []
     for tag in tags:
-        player = find_player_in_rows(tag, rows)
-        if player:
-            results.append({"found": True, **player})
+        players = find_players_in_rows(tag, rows)
+        if players:
+            for player in players:
+                results.append({"found": True, **player})
         else:
             results.append({"btag": tag, "found": False, "error": "Not found in this archived leaderboard"})
     return results
@@ -393,20 +408,22 @@ def find_live_players(tags, params):
         first_rows = board["rows"]
     except (requests.RequestException, ValueError, KeyError, TypeError) as error:
         raise RuntimeError("Blizzard did not return this season's leaderboard") from error
-    found = {}
+    found = defaultdict(list)
     pending = list(dict.fromkeys(tags))
     incomplete = False
 
     def consume(rows, page):
         for tag in list(pending):
-            player = find_player_in_rows(tag, rows, page)
-            if player:
-                found[tag] = {"found": True, **player}
+            matched = find_players_in_rows(tag, rows, page)
+            for player in matched:
+                if not any(existing.get("btag") == player["btag"] and existing.get("rank") == player["rank"] for existing in found[tag]):
+                    found[tag].append({"found": True, **player})
+                    with _lock:
+                        if len(_live_hints) >= MAX_CACHE_ENTRIES:
+                            _live_hints.pop(next(iter(_live_hints)))
+                        _live_hints[(region, mode, season, tag.lower())] = player
+            if "#" in tag and found[tag]:
                 pending.remove(tag)
-                with _lock:
-                    if len(_live_hints) >= MAX_CACHE_ENTRIES:
-                        _live_hints.pop(next(iter(_live_hints)))
-                    _live_hints[(region, mode, season, tag.lower())] = player
 
     consume(first_rows, 1)
     if pending and total_pages > 1:
@@ -436,10 +453,29 @@ def find_live_players(tags, params):
                         consume(rows, page)
                 if pending_batch_failed:
                     break
-    return [found.get(tag, {"btag": tag, "found": False,
-             "incomplete": incomplete,
-             "error": ("Lookup incomplete: the page limit was reached or some pages were unavailable."
-                       if incomplete else "Not found in the current public leaderboard")}) for tag in tags]
+                if not any("#" in t for t in pending) and (MAX_PAGES_TO_SCAN > 0 and len(found) >= len(tags)):
+                    pass
+
+    results = []
+    for tag in tags:
+        if found[tag]:
+            for p in found[tag]:
+                player_result = dict(p)
+                if incomplete and "#" not in tag:
+                    player_result["incomplete"] = True
+                results.append(player_result)
+        else:
+            results.append({
+                "btag": tag,
+                "found": False,
+                "incomplete": incomplete,
+                "error": (
+                    "Lookup incomplete: the page limit was reached or some pages were unavailable."
+                    if incomplete
+                    else "Not found in the current public leaderboard"
+                ),
+            })
+    return results
 
 
 def find_player_in_season(tag: str, params: dict):
@@ -605,8 +641,8 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
             if rows is None:
                 unavailable.append(season)
             else:
-                player = find_player_in_rows(tag, rows)
-                if player:
+                players = find_players_in_rows(tag, rows)
+                for player in players:
                     matches.append({"season": season, **player})
             scanned.append(season)
         # The frontend can display these matches while live verification is queued.
@@ -618,17 +654,20 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
             snapshot = load_current_snapshot(region, mode, current_season)
             if DATA_MODE == "live":
                 try:
-                    player = search_live_players([tag], mode, region, current_season, None)[0]
-                    checked_at = player.get("checkedAt")
-                    if player.get("found"):
-                        matches.append({"season": current_season, **player})
-                    elif player.get("incomplete"):
-                        unavailable.append(current_season)
+                    players = search_live_players([tag], mode, region, current_season, None)
+                    checked_at = players[0].get("checkedAt") if players else None
+                    found_any = False
+                    for player in players:
+                        if player.get("found"):
+                            matches.append({"season": current_season, **player})
+                            found_any = True
+                        elif player.get("incomplete") and not found_any:
+                            unavailable.append(current_season)
                 except HTTPException:
                     unavailable.append(current_season)
             elif snapshot:
-                player = find_player_in_rows(tag, snapshot["rows"])
-                if player:
+                players = find_players_in_rows(tag, snapshot["rows"])
+                for player in players:
                     matches.append({"season": current_season, **player})
             else:
                 unavailable.append(current_season)

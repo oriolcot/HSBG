@@ -8,6 +8,8 @@ current_leaderboards/
 
 # Local deployment details and private operational files
 /deploy/
+deploy.ps1
+.deploy.env
 *.log
 .env.*
 !.env.example

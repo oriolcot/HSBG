@@ -96,5 +96,61 @@ class SmartSearchTests(unittest.TestCase):
             data=json.loads((Path(directory)/'EU-battlegrounds.json').read_text())
             self.assertEqual(data['rows'][0]['rating'],7000);self.assertIn('capturedAt',data)
 
+    def test_exact_name_matching_avoids_prefix_false_positives(self):
+        self.assertFalse(b.player_matches_tag('Daniel#1234', 'Dan'))
+        self.assertTrue(b.player_matches_tag('Dan#1234', 'Dan'))
+        self.assertTrue(b.player_matches_tag('Dan', 'Dan'))
+        self.assertTrue(b.player_matches_tag('dan#1234', 'DAN'))
+        self.assertFalse(b.player_matches_tag('Dan#1234', 'Dan#5678'))
+
+    def test_multiple_players_sharing_name_are_all_returned(self):
+        rows = [
+            {'accountid': 'Dan#1111', 'rank': 10, 'rating': 12000},
+            {'accountid': 'Daniel#3333', 'rank': 5, 'rating': 13000},
+            {'accountid': 'Dan#2222', 'rank': 20, 'rating': 11000},
+        ]
+        results = b.archived_player_results(['Dan'], rows)
+        self.assertEqual(len(results), 2)
+        self.assertEqual([r['btag'] for r in results], ['Dan#1111', 'Dan#2222'])
+
+    def test_archive_cache_bounds_memory(self):
+        b._archive_cache.clear()
+        with tempfile.TemporaryDirectory() as directory, patch.object(b, 'ARCHIVE_DIR', Path(directory)), patch.object(b, 'MAX_CACHED_ARCHIVE_SEASONS', 2):
+            for season in [1, 2, 3]:
+                season_dir = Path(directory) / 'EU' / 'battlegrounds'
+                season_dir.mkdir(parents=True, exist_ok=True)
+                p = season_dir / f'season-{season}.json'
+                p.write_text(json.dumps({'rows': [{'accountid': f'P{season}', 'rank': 1, 'rating': 9000}]}))
+                b.load_archive_rows('EU', 'battlegrounds', season)
+            self.assertLessEqual(len(b._archive_cache), 2)
+
+    def test_find_live_players_returns_multiple_matches_for_shared_name(self):
+        first = {
+            'seasonId': 19,
+            'leaderboard': {
+                'pagination': {'totalPages': 1},
+                'rows': [
+                    {'accountid': 'Rain#1111', 'rank': 10, 'rating': 12000},
+                    {'accountid': 'Rain#2222', 'rank': 20, 'rating': 11000},
+                ],
+            },
+        }
+        with patch.object(b, 'blizzard_get', return_value=first):
+            results = b.find_live_players(['Rain'], self.params)
+            self.assertEqual(len(results), 2)
+    def test_find_live_players_flags_incomplete_when_capped_even_if_found(self):
+        first = {
+            'seasonId': 19,
+            'leaderboard': {
+                'pagination': {'totalPages': 5},
+                'rows': [{'accountid': 'Rain#1111', 'rank': 10, 'rating': 12000}],
+            },
+        }
+        with patch.object(b, 'blizzard_get', return_value=first), patch.object(b, 'MAX_PAGES_TO_SCAN', 1):
+            results = b.find_live_players(['Rain'], self.params)
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0]['found'])
+            self.assertTrue(results[0]['incomplete'])
+
 
 if __name__ == '__main__':unittest.main()

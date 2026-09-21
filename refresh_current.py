@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """Refresh complete, dated snapshots of the live public leaderboards."""
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 import json
 import os
 import time
@@ -72,10 +80,14 @@ def main():
         slot = (datetime.now(UTC).minute % 30) // 5
         boards = [boards[slot]]
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    with (SNAPSHOT_DIR / '.refresh.lock').open('w') as lock:
+    with (SNAPSHOT_DIR / '.refresh.lock').open('w+') as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            if fcntl:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
             print('A refresh is already running; skipping.', flush=True)
             return
         upstream._worker_limit = 4
