@@ -51,6 +51,16 @@ class LiveModeTests(unittest.TestCase):
         self.assertEqual(job['result']['unavailableSeasons'],[19])
         self.assertEqual(job['result']['matches'][0]['season'],18)
 
+    def test_found_partial_history_preserves_warning(self):
+        b._career_jobs['partial-found'] = {'total_seasons': 1}
+        player = {'found': True, 'btag': 'Rain', 'rank': 10, 'rating': 9000, 'incomplete': True}
+        with patch.object(b, 'load_current_snapshot', return_value=None), patch.object(b, 'search_live_players', return_value=[player]):
+            b.run_career_search('partial-found', 'Rain', 'battlegrounds', 'EU', 19, [19], ('partial-found',))
+        result = b._career_jobs.pop('partial-found')['result']
+        self.assertEqual(result['incompleteSeasons'], [19])
+        self.assertEqual(len(result['matches']), 1)
+        self.assertEqual(result['unavailableSeasons'], [])
+
     def test_invalid_mode_fails_at_startup(self):
         import subprocess,os,sys
         result=subprocess.run([sys.executable,'-c','import backend'],env={**os.environ,'HSBG_DATA_MODE':'typo'},capture_output=True,text=True)

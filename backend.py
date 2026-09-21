@@ -622,12 +622,13 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
     started = time.monotonic()
     matches, unavailable, scanned = [], [], []
     checked_at = None
+    incomplete_seasons = []
 
     def result():
         return {"btag": tag, "mode": mode, "region": region,
                 "currentSeason": current_season, "dataMode": DATA_MODE, "checkedAt": checked_at,
                 "capturedAt": None if DATA_MODE == "live" else (load_current_snapshot(region, mode, current_season) or {}).get("capturedAt"), "scannedSeasons": list(scanned),
-                "unavailableSeasons": list(unavailable),
+                "unavailableSeasons": list(unavailable), "incompleteSeasons": list(incomplete_seasons),
                 "matches": sorted(matches, key=lambda match: match["season"], reverse=True),
                 "elapsedSeconds": round(time.monotonic() - started, 1)}
 
@@ -656,6 +657,8 @@ def run_career_search(job_id, tag, mode, region, current_season, seasons_to_scan
                 try:
                     players = search_live_players([tag], mode, region, current_season, None)
                     checked_at = players[0].get("checkedAt") if players else None
+                    if any(player.get("incomplete") for player in players):
+                        incomplete_seasons.append(current_season)
                     found_any = False
                     for player in players:
                         if player.get("found"):

@@ -27,3 +27,11 @@ assert.match(freshnessContext.resultFreshness({dataMode:'live',checkedAt:'2026-0
 assert.match(freshnessContext.resultFreshness({capturedAt:'2026-01-01T00:00:00Z'}), /^Current leaderboard updated:/);
 assert.equal(freshnessContext.resultFreshness(undefined), '');
 console.log('PASS: freshness labels distinguish direct lookups from saved snapshots');
+const warningContext = {};
+vm.createContext(warningContext);
+vm.runInContext(html.split('\n').find(line=>line.includes('function partialLookupWarning(')),warningContext);
+assert.match(warningContext.partialLookupWarning([{found:true,incomplete:true}]),/Partial lookup/);
+assert.match(warningContext.partialLookupWarning({incompleteSeasons:[19],matches:[{season:19}]}),/Partial lookup/);
+assert.equal(warningContext.partialLookupWarning([{found:true}]),'');
+assert.equal(warningContext.partialLookupWarning({matches:[],incompleteSeasons:[]}),'');
+console.log('PASS: partial results warn even when players were found');
