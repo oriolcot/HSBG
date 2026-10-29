@@ -2,13 +2,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const html = fs.readFileSync('assets/app.js', 'utf8');
-const fn = html.split('\n').find(line => line.includes('async function waitForCareerResult(jobId)'));
+const pollFn = html.split('\n').find(line => line.includes('async function waitForCareerResult(jobId)'));
+const requestFn = html.split('\n').find(line => line.includes('async function fetchJson('));
+const fn = requestFn + '\n' + pollFn;
 (async () => {
   const partial = {matches:[{season:18}],scannedSeasons:[18],unavailableSeasons:[]};
   const final = {...partial,scannedSeasons:[18,19]};
   const messages = [{status:'queued',result:partial},{status:'running',result:partial},{status:'completed',result:final}];
   const renders = [];
-  const context = {API_BASE_URL:'',wait:async()=>{},status:{textContent:''},
+  const context = {API_BASE_URL:'',wait:async()=>{},status:{textContent:''},AbortController,window:{setTimeout,clearTimeout},
     renderCareerResults:(result,pending)=>renders.push({result,pending}),
     fetch:async()=>({ok:true,json:async()=>messages.shift()})};
   vm.createContext(context);vm.runInContext(fn,context);
@@ -35,3 +37,18 @@ assert.match(warningContext.partialLookupWarning({incompleteSeasons:[19],matches
 assert.equal(warningContext.partialLookupWarning([{found:true}]),'');
 assert.equal(warningContext.partialLookupWarning({matches:[],incompleteSeasons:[]}),'');
 console.log('PASS: partial results warn even when players were found');
+
+(async () => {
+  let now = 0;
+  const partial = {matches:[{season:19}],scannedSeasons:[19],unavailableSeasons:[]};
+  const renders = [];
+  const context = {API_BASE_URL:'',Date:{now:()=>now},wait:async()=>{now+=120000;},status:{textContent:''},
+    renderCareerResults:(result,pending)=>renders.push({result,pending}),
+    fetchJson:async()=>({response:{ok:true},payload:{status:'running',result:partial}})};
+  vm.createContext(context);vm.runInContext(pollFn,context);
+  await assert.rejects(context.waitForCareerResult('stalled'),/history search is taking too long/);
+  assert.equal(now,240000);
+  assert.equal(renders.length,1);
+  assert.equal(renders[0].result,partial);
+  console.log('PASS: stalled history stops after four minutes and retains partial results');
+})().catch(error=>{console.error(error);process.exitCode=1;});
